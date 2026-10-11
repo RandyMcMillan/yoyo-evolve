@@ -26,8 +26,12 @@
 //! - Oversized commands (>10k bytes fail closed — too large to analyze reliably)
 //! - Fd-redirect smuggling (`exec N<>file`, writes into `/dev/fd/N`,
 //!   odd `N>&M` dups combined with command substitution)
+//! - Unanalyzable command words (`X=rm; $X …`, `$(echo rm) …`) — the program
+//!   is chosen by an expansion, so it goes to confirmation (`indirect_command`)
 
 use std::sync::LazyLock;
+
+mod indirect_command;
 
 use regex::Regex;
 
@@ -73,6 +77,7 @@ const SAFETY_CHECKS: &[SafetyCheck] = &[
     check_pipe_to_interpreter,
     check_symlink_attack,
     check_archive_extraction_to_system,
+    indirect_command::check_indirect_command_word,
 ];
 
 /// The shell operators that end one command segment and begin the next.

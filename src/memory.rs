@@ -645,7 +645,11 @@ mod tests {
     use std::fs;
 
     fn temp_memory_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("yoyo_test_memory_{}", name));
+        // Per-process suffix: concurrent `cargo test` runs (auto-watch plus
+        // the gate) otherwise share this dir, and one run's `cleanup` deletes
+        // the other's file mid-test (seen as 20 saves then 7 loaded).
+        let dir =
+            std::env::temp_dir().join(format!("yoyo_test_memory_{}_{}", name, std::process::id()));
         let _ = fs::create_dir_all(&dir);
         dir.join(MEMORY_FILE)
     }
