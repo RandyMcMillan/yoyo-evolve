@@ -62,6 +62,15 @@ This writes to `yoyo-session.json` in the current directory.
 
 Sessions are stored as JSON files containing the conversation message history. The format is determined by the yoagent library.
 
+### The `/todo` list travels with the session
+
+The `/todo` list is session state, so it is saved and restored with the conversation. Every save path (`/save`, auto-save on exit, `--save-session`) writes the list to a sibling file named after the session with a `.todos.json` extension: `.yoyo/last-session.json` gets `.yoyo/last-session.todos.json`, and `yoyo-session.json` gets `yoyo-session.todos.json`. Every resume path (`/load`, `--continue`) reads it back, with the same IDs, descriptions and statuses.
+
+- Loading a session **replaces** the current list. A session saved before this existed, or saved with an empty list, has no sibling file and resumes with an empty list.
+- Saving with an empty list writes no sibling file and removes a stale one left at the same path, so old items can't come back.
+- If the sibling file can't be read or parsed, the resume still succeeds: yoyo prints one warning on stderr and starts with an empty list.
+- `/todo board` tasks are files under `session_plan/` and are not part of this; only the session list is.
+
 ## Error handling
 
 - If no previous session exists when using `--continue`, yoyo prints a message and starts fresh

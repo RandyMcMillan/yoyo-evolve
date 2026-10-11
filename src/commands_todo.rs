@@ -36,7 +36,7 @@ pub(crate) fn shell_todo_refusal(verb: &str) -> Option<String> {
          \x20 The todo list is session-only: it lives inside a running yoyo session, and each\n\
          \x20 shell call is a fresh process, so the change would be forgotten when it exits.\n\
          \x20 Start yoyo and use: /todo {verb}{args}\n\
-         \x20 Persistence across invocations is tracked in #1005."
+         \x20 The list is saved with the session and comes back on /load or --continue (#1005)."
     ))
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn shell_todo_session_note(verb: &str) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TodoStatus {
     Pending,
     InProgress,
@@ -90,7 +90,7 @@ fn success_marker() -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub id: usize,
     pub description: String,
@@ -127,6 +127,84 @@ pub fn todo_update(id: usize, status: TodoStatus) -> Result<(), String> {
 /// Return a snapshot of all todo items.
 pub fn todo_list() -> Vec<TodoItem> {
     rw_read_or_recover(&TODO_LIST).clone()
+}
+
+/// Replace the whole list with `items` (session resume, #1005) and set the
+/// next ID past the largest restored one, so a later `/todo add` cannot reuse
+/// an ID that is already on the list. An empty `items` is a plain clear.
+pub fn restore_todos(items: Vec<TodoItem>) {
+    let next = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+    *rw_write_or_recover(&TODO_LIST) = items;
+    TODO_NEXT_ID.store(next, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Where the todo list for the session file `session` lives (#1005).
+///
+/// The session file itself is `Agent::save_messages()` output, a bare JSON
+/// array of messages with no wrapper to add a field to, so the list rides in a
+/// sibling file instead: `.yoyo/last-session.json` ->
+/// `.yoyo/last-session.todos.json`, `yoyo-session.json` ->
+/// `yoyo-session.todos.json`. Old session files simply have no sibling.
+pub fn todos_sidecar_path(session: &std::path::Path) -> std::path::PathBuf {
+    session.with_extension("todos.json")
+}
+
+/// Write `items` as the todo sidecar of `session`. An empty list writes no
+/// file and removes a stale sidecar left by an earlier save to the same path,
+/// so saving an empty list can never resurrect old items on resume (and a
+/// plain `/save` with no todos still creates exactly one file, as before).
+pub fn write_todos_sidecar(session: &std::path::Path, items: &[TodoItem]) -> Result<(), String> {
+    let path = todos_sidecar_path(session);
+    if items.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        };
+    }
+    let json = serde_json::to_string_pretty(items).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Read the todo sidecar of `session`. A missing sidecar is `Ok(empty)` --
+/// that is every session saved before #1005 and every session saved with no
+/// todos. Unreadable or unparsable data is `Err`, for the caller to warn on.
+pub fn read_todos_sidecar(session: &std::path::Path) -> Result<Vec<TodoItem>, String> {
+    let path = todos_sidecar_path(session);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Save the live todo list beside a session that was just written. Returns
+/// the warning to print if the sidecar could not be written; the session
+/// file itself is already saved, so this never fails the save.
+pub fn save_session_todos(session: &std::path::Path) -> Option<String> {
+    write_todos_sidecar(session, &todo_list())
+        .err()
+        .map(|e| format!("warning: todo list not saved with the session: {e}"))
+}
+
+/// Restore the todo list for a session that was just loaded. The list is
+/// session state, so it is REPLACED: a session with no sidecar resumes with an
+/// empty list. Corrupt data never fails the resume -- the list starts empty
+/// and the returned warning is printed once by the caller.
+pub fn restore_session_todos(session: &std::path::Path) -> Option<String> {
+    match read_todos_sidecar(session) {
+        Ok(items) => {
+            restore_todos(items);
+            None
+        }
+        Err(e) => {
+            restore_todos(Vec::new());
+            Some(format!(
+                "warning: could not restore the todo list ({e}); starting with an empty list"
+            ))
+        }
+    }
 }
 
 /// Clear all todo items and reset the ID counter.
@@ -755,7 +833,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn shell_todo_refusal_exact_text_names_1005_and_slash_todo() {
+    fn shell_todo_refusal_exact_text_points_at_session_resume_and_slash_todo() {
         assert_eq!(
             shell_todo_refusal("add").as_deref(),
             Some(
@@ -763,12 +841,15 @@ mod tests {
                  \x20 The todo list is session-only: it lives inside a running yoyo session, and each\n\
                  \x20 shell call is a fresh process, so the change would be forgotten when it exits.\n\
                  \x20 Start yoyo and use: /todo add <description>\n\
-                 \x20 Persistence across invocations is tracked in #1005."
+                 \x20 The list is saved with the session and comes back on /load or --continue (#1005)."
             )
         );
         for verb in SESSION_MUTATING_TODO_VERBS {
             let msg = shell_todo_refusal(verb).expect("mutating verb must refuse");
-            assert!(msg.contains("#1005"), "{verb}: {msg}");
+            assert!(msg.contains("--continue"), "{verb}: {msg}");
+            // #1005 shipped the session resume, so the refusal names the
+            // behaviour, never "tracked in #N" (a pointer that dies on close).
+            assert!(!msg.contains("tracked in #"), "{verb}: {msg}");
             // #679 is closed; a refusal naming it is a dead end (#682).
             assert!(!msg.contains("#679"), "{verb}: {msg}");
             assert!(msg.contains(&format!("/todo {verb}")), "{verb}: {msg}");
@@ -1558,5 +1639,124 @@ mod tests {
         update_task_status(dir.to_str().unwrap(), "task_01", "active").unwrap();
         let content = std::fs::read_to_string(dir.join("task_01.md")).unwrap();
         assert!(content.contains("Status: active"));
+    }
+
+    // ── #1005: the todo list is saved and restored with the session ──
+
+    fn mixed_items() -> Vec<TodoItem> {
+        vec![
+            TodoItem {
+                id: 3,
+                description: "write the parser".to_string(),
+                status: TodoStatus::Done,
+            },
+            TodoItem {
+                id: 5,
+                description: "wire résumé ✓ path".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: 7,
+                description: "update docs".to_string(),
+                status: TodoStatus::Pending,
+            },
+        ]
+    }
+
+    #[test]
+    fn todos_sidecar_path_sits_beside_the_session() {
+        use std::path::Path;
+        assert_eq!(
+            todos_sidecar_path(Path::new(".yoyo/last-session.json")),
+            Path::new(".yoyo/last-session.todos.json")
+        );
+        assert_eq!(
+            todos_sidecar_path(Path::new("yoyo-session.json")),
+            Path::new("yoyo-session.todos.json")
+        );
+        assert_eq!(
+            todos_sidecar_path(Path::new("mysession")),
+            Path::new("mysession.todos.json")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_todos_round_trip_through_save_clear_restore() {
+        let dir = make_temp_dir();
+        let session = dir.path().join("s.json");
+        todo_clear();
+        let a = todo_add("write the parser");
+        let b = todo_add("wire the path");
+        let _c = todo_add("update docs");
+        todo_update(a, TodoStatus::Done).unwrap();
+        todo_update(b, TodoStatus::InProgress).unwrap();
+        let before = todo_list();
+        assert_eq!(before.len(), 3, "anti-vacuous: fixture has three items");
+
+        assert_eq!(save_session_todos(&session), None);
+        assert!(todos_sidecar_path(&session).exists());
+        todo_clear();
+        assert!(todo_list().is_empty());
+
+        assert_eq!(restore_session_todos(&session), None);
+        assert_eq!(todo_list(), before);
+        // The next add must not reuse a restored ID.
+        let next = todo_add("after resume");
+        assert_eq!(next, before.iter().map(|i| i.id).max().unwrap() + 1);
+        todo_clear();
+    }
+
+    #[test]
+    fn sidecar_round_trip_keeps_ids_text_and_statuses() {
+        let dir = make_temp_dir();
+        let session = dir.path().join("s.json");
+        write_todos_sidecar(&session, &mixed_items()).unwrap();
+        assert_eq!(read_todos_sidecar(&session).unwrap(), mixed_items());
+    }
+
+    #[test]
+    #[serial]
+    fn old_session_without_sidecar_restores_empty_list() {
+        let dir = make_temp_dir();
+        let session = dir.path().join("old.json");
+        std::fs::write(&session, "[]").unwrap();
+        todo_clear();
+        todo_add("left over from before the resume");
+        assert_eq!(restore_session_todos(&session), None);
+        assert!(todo_list().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn corrupt_sidecar_warns_and_restores_empty_list() {
+        let dir = make_temp_dir();
+        let session = dir.path().join("s.json");
+        std::fs::write(todos_sidecar_path(&session), "{not json").unwrap();
+        todo_clear();
+        todo_add("stale");
+        let warning = restore_session_todos(&session).expect("corrupt data must warn");
+        assert!(warning.starts_with("warning: could not restore the todo list ("));
+        assert!(warning.ends_with("); starting with an empty list"));
+        assert!(todo_list().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_list_saves_no_sidecar_and_removes_a_stale_one() {
+        let dir = make_temp_dir();
+        let session = dir.path().join("s.json");
+        write_todos_sidecar(&session, &mixed_items()).unwrap();
+        assert!(todos_sidecar_path(&session).exists());
+        todo_clear();
+        assert_eq!(save_session_todos(&session), None);
+        assert!(
+            !todos_sidecar_path(&session).exists(),
+            "an empty save must not leave old items to resurrect"
+        );
+        // Near-miss: a session saved with an empty list restores empty, not an error.
+        todo_add("stale");
+        assert_eq!(restore_session_todos(&session), None);
+        assert!(todo_list().is_empty());
     }
 }

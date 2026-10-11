@@ -420,6 +420,12 @@ fn auto_save_on_exit_in(agent: &Agent, root: &std::path::Path) {
             eprintln!(
                 "{DIM}  session auto-saved to {AUTO_SAVE_SESSION_PATH} ({message_count} messages){RESET}"
             );
+            // #1005: the /todo list is session state; it rides beside the session.
+            if let Some(w) =
+                crate::commands_todo::save_session_todos(&root.join(AUTO_SAVE_SESSION_PATH))
+            {
+                eprintln!("{w}");
+            }
         }
         AutoSaveOutcome::Failed { path, err } => {
             eprintln!("warning: could not auto-save session to {path}: {err} — session not saved");
@@ -482,10 +488,18 @@ pub fn handle_save(agent: &Agent, input: &str) {
     };
     match agent.save_messages() {
         Ok(json) => match std::fs::write(path, &json) {
-            Ok(_) => println!(
-                "{DIM}  (session saved to {path}, {} messages){RESET}\n",
-                agent.messages().len()
-            ),
+            Ok(_) => {
+                println!(
+                    "{DIM}  (session saved to {path}, {} messages){RESET}\n",
+                    agent.messages().len()
+                );
+                // #1005: save the /todo list beside the session file.
+                if let Some(w) =
+                    crate::commands_todo::save_session_todos(std::path::Path::new(path))
+                {
+                    eprintln!("{w}");
+                }
+            }
             Err(e) => eprintln!("{RED}  error saving: {e}{RESET}\n"),
         },
         Err(e) => eprintln!("{RED}  error serializing: {e}{RESET}\n"),
@@ -503,10 +517,18 @@ pub fn handle_load(agent: &mut Agent, input: &str) {
     };
     match std::fs::read_to_string(path) {
         Ok(json) => match agent.restore_messages(&json) {
-            Ok(_) => println!(
-                "{DIM}  (session loaded from {path}, {} messages){RESET}\n",
-                agent.messages().len()
-            ),
+            Ok(_) => {
+                println!(
+                    "{DIM}  (session loaded from {path}, {} messages){RESET}\n",
+                    agent.messages().len()
+                );
+                // #1005: the /todo list comes back with the session it was saved with.
+                if let Some(w) =
+                    crate::commands_todo::restore_session_todos(std::path::Path::new(path))
+                {
+                    eprintln!("{w}");
+                }
+            }
             Err(e) => eprintln!("{RED}  error parsing: {e}{RESET}\n"),
         },
         Err(e) => eprintln!("{RED}  error reading {path}: {e}{RESET}\n"),

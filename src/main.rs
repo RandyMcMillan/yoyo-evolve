@@ -1079,7 +1079,13 @@ async fn save_session_after_turn(
     };
     agent.finish().await;
     match save_session_to(agent, path) {
-        Ok(()) => code,
+        Ok(()) => {
+            // #1005: the /todo list rides beside the session file.
+            if let Some(w) = commands_todo::save_session_todos(path) {
+                eprintln!("{w}");
+            }
+            code
+        }
         Err(e) => {
             eprintln!("{}", save_session_error(path, &e));
             if code != 0 {
@@ -1134,6 +1140,12 @@ fn restore_session(agent: &mut Agent, strict: bool) {
     let session_path = commands_session::continue_session_path();
     match restore_session_result(agent, std::path::Path::new(session_path)) {
         Ok(n) => {
+            // #1005: restore the /todo list saved with this session.
+            if let Some(w) =
+                commands_todo::restore_session_todos(std::path::Path::new(session_path))
+            {
+                eprintln!("{w}");
+            }
             // #979: stream-json acknowledges the restore after agentStart.
             prompt::record_session_restored(n);
             let summary = commands_session::session_resume_summary(agent.messages());
