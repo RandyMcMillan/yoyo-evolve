@@ -33,11 +33,24 @@ pub(super) fn should_retry_after_partial(
 /// answer — only the bytes already written to the pipe stay. The retry cap is
 /// unchanged, so an every-attempt failure still ends nonzero.
 ///
-/// Scope: yoyo's own retry loops only. yoagent's internal `ProviderRetry`
-/// door (`handle_provider_retry`, #989) does not consult the opt-in, because
-/// #991 (`retry_safe_events`) answers that door by making duplicates
-/// impossible rather than accepting them. That asymmetry is deliberate, not a
-/// "two doors, one deaf" miss.
+/// Scope: all five retry sites, including yoagent's internal `ProviderRetry`
+/// door (`handle_provider_retry`, #989). On that door yoagent has ALREADY
+/// decided to retry; yoyo can only abort or let it through. Let through on a
+/// pipe, the reader sees the dying partial, its line closed, one blank line,
+/// then the retried answer (`PARTIAL_\n\nPONG\n`, measured Day 225 under
+/// `opt_in_provider_retry_after_partial_succeeds_with_attempts_separated`):
+/// the renderer's own newlines (the error-stop `MessageEnd` closes the line,
+/// the next attempt's first text delta opens with one) keep the two attempts
+/// apart, so no extra separator is emitted here.
+///
+/// Superseded claim, recorded rather than erased (Day 225): this paragraph
+/// said the `ProviderRetry` door deliberately ignores the opt-in because #991
+/// (`retry_safe_events`) would answer that door by making duplicates
+/// impossible. #991 has not landed, and yoagent >= 0.24.3 (#1007) reclassifies
+/// Anthropic 529 / `overloaded_error` as a retried `RateLimited`, which moves
+/// Overloaded onto this door: an opted-in loop would have lost the turn again
+/// (the Day-219 loss). The upgrade needed a decision before #991, so the door
+/// now reads the opt-in. Default (off) is unchanged: it still aborts (#989).
 pub(super) fn retry_after_partial_allowed(
     opted_in: bool,
     stdout_is_terminal: bool,
@@ -49,7 +62,7 @@ pub(super) fn retry_after_partial_allowed(
 /// Live-state wrapper both retry loops call: one condition, never two copies.
 /// The dying attempt's text reached stdout only when stdout is NOT reserved for
 /// a final payload (`--print`/json hold it back, so they retry safely).
-/// `opted_in`: the #997 opt-in (yoyo's loops) or `false` (`handle_provider_retry`).
+/// `opted_in`: the #997 opt-in, read by every caller (Day 225: `handle_provider_retry` too).
 pub(super) fn retry_blocked_by_streamed_partial(dying_text: &str, opted_in: bool) -> bool {
     let streamed = !crate::format::stdout_reserved() && !dying_text.is_empty();
     !retry_after_partial_allowed(opted_in, std::io::stdout().is_terminal(), streamed)

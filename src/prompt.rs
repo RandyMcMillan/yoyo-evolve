@@ -977,12 +977,14 @@ impl PromptEventState {
     /// fatal so the process exits non-zero. A later `Aborted` stop is
     /// `StopHandling::Ignore`, so it cannot overwrite this. When the retry is
     /// allowed, the dead attempt's text is dropped from the collected answer
-    /// so `--print`/json never carry it.
+    /// so `--print`/json never carry it. With the #997 `retry_after_partial`
+    /// opt-in ON, a pipe that already holds the partial is let through too
+    /// (Day 225; was hard-coded `false` before, see retry_after_partial.rs).
     fn handle_provider_retry(&mut self, error: &str) -> bool {
         let start = self.attempt_text_start.min(self.collected_text.len());
         let dying = self.collected_text.get(start..).unwrap_or("").to_string();
-        // `false`: this door ignores the #997 opt-in on purpose (#991; see retry_after_partial.rs).
-        if retry_blocked_by_streamed_partial(&dying, false) {
+        // #997: the same opt-in the four yoyo retry sites read (Day 225; see retry_after_partial.rs).
+        if retry_blocked_by_streamed_partial(&dying, is_retry_after_partial()) {
             if let Some(s) = self.spinner.take() {
                 s.stop();
             }

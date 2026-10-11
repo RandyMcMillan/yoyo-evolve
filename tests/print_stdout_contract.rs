@@ -1548,6 +1548,134 @@ fn assert_partial_retry_reading(run: &Run) {
     assert!(!run.success, "#989: the dead turn must exit nonzero");
 }
 
+// #997 on the ProviderRetry door (Day 225, unblocks the yoagent upgrade #1007).
+// The #989 tests above are the opt-in-OFF rows and stay unedited. These run the
+// SAME fixtures with `retry_after_partial = true` seeded in the cwd. Why these
+// statuses: yoagent 0.24.2 `ProviderError::is_retryable` (retry.rs:69) is
+// `RateLimited | Network`, and an SSE `error` event of type `rate_limit_error`
+// classifies as `RateLimited`, so yoagent ITSELF retries; yoyo's own loop
+// never sees the dying attempt. yoagent >= 0.24.3 moves Anthropic 529 /
+// `overloaded_error` onto this same classification, which is why this door
+// must honour the opt-in before that upgrade.
+
+fn rate_limited_after(partial: &str) -> String {
+    sse_partial_then(
+        partial,
+        Some((
+            "error",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+                .to_string(),
+        )),
+    )
+}
+
+fn provider_retry_opt_in_run(bodies: Vec<String>) -> Run {
+    let run = run_yoyo_seeded(
+        &[OPT_IN_CONFIG],
+        &["--no-tools", "--max-turns", "1"],
+        &["-p", "hi"],
+        None,
+        bodies,
+        Duration::from_secs(150),
+    );
+    eprintln!(
+        "PROBE #997/ProviderRetry: stdout={:?} success={} requests={} stderr_tail={:?}",
+        String::from_utf8_lossy(&run.stdout),
+        run.success,
+        run.requests,
+        run.stderr.lines().rev().take(6).collect::<Vec<_>>()
+    );
+    run
+}
+
+/// Opt-in ON, partial then a yoagent-retried `rate_limit_error`, then a clean
+/// answer: the retry is let through, exit 0, and the two attempts are kept
+/// apart on the pipe by a blank line (never glued into `PARTIAL_PONG`).
+#[test]
+fn opt_in_provider_retry_after_partial_succeeds_with_attempts_separated() {
+    let run = provider_retry_opt_in_run(vec![
+        rate_limited_after("PARTIAL_"),
+        sse_text_body(RETRY_ANSWER),
+    ]);
+    assert_eq!(
+        run.requests, 2,
+        "#997: opted in, yoagent's retry is let through; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.success,
+        "#997: retry succeeded, exit 0; stderr={}",
+        run.stderr
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "PARTIAL_\n\nPONG\n",
+        "#997: partial once, a blank line, then the answer; stderr={}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr
+            .contains("not retrying: part of the answer was already written"),
+        "#997: no skip note when the retry happens; stderr={}",
+        run.stderr
+    );
+}
+
+/// Second spelling: partial, then the stream simply ends (`Network`).
+#[test]
+fn opt_in_provider_retry_after_truncated_stream_succeeds_with_attempts_separated() {
+    let run = provider_retry_opt_in_run(vec![
+        sse_partial_then("PARTIAL_", None),
+        sse_text_body(RETRY_ANSWER),
+    ]);
+    assert_eq!(run.requests, 2, "stderr={}", run.stderr);
+    assert!(run.success, "stderr={}", run.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "PARTIAL_\n\nPONG\n",
+        "stderr={}",
+        run.stderr
+    );
+}
+
+/// Opt-in ON, death BEFORE any text: stdout is exactly the answer, with no
+/// stray separator for an attempt that never wrote anything.
+#[test]
+fn opt_in_provider_retry_before_text_yields_exactly_the_answer() {
+    let run = provider_retry_opt_in_run(vec![http_429_response(), sse_text_body(RETRY_ANSWER)]);
+    assert_eq!(run.requests, 2, "stderr={}", run.stderr);
+    assert!(run.success, "stderr={}", run.stderr);
+    assert_eq!(String::from_utf8_lossy(&run.stdout), RETRY_ANSWER);
+}
+
+/// Opt-in ON, every attempt dies after text: the run must still end nonzero,
+/// bounded (yoagent's own cap, then yoyo's). Readings pinned as observed
+/// Day 225: 24 requests = 4 per yoagent call (1 + RetryConfig::default's 3)
+/// times 6 yoyo attempts (MAX_RETRIES + 1), ~70s of backoff, exit nonzero.
+/// The worst-case cost of the opt-in on this door: one partial per request,
+/// each kept apart by a blank line. Without the opt-in this is 1 request.
+#[test]
+fn opt_in_provider_retry_every_attempt_dying_still_exits_nonzero() {
+    let run = provider_retry_opt_in_run(vec![rate_limited_after("PARTIAL_")]);
+    assert!(!run.success, "every attempt failed; stderr={}", run.stderr);
+    assert_eq!(
+        run.requests, 24,
+        "4 yoagent x 6 yoyo; stderr={}",
+        run.stderr
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        ["PARTIAL_\n"; 24].join("\n"),
+        "stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("failed after 6 attempts"),
+        "yoyo's own cap reported; stderr={}",
+        run.stderr
+    );
+}
+
 // #989 stream-json door, probed Day 219 (Task 2). Hypothesis tested: "the
 // final record concatenates PARTIAL_ with PONG, exit 0". FALSE on the record:
 // messageEnd/turnEnd/agentEnd carry exactly "PONG\n". The dead attempt is
