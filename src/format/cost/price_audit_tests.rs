@@ -1248,6 +1248,8 @@ fn the_audit_asks_the_pricing_resolver_not_the_shipped_list() {
 // whoever upgrades reads the remedy instead of 22 bare price mismatches that
 // invite weakening. If they go red after a yoagent bump, the fix is
 // `enable_bundled()` (at startup AND before tests read a preset).
+// Wired Day 225 (#1007): `agent_builder::ensure_bundled_prices`, a `Once` on
+// the preset/model-config path that both `main` and unit tests reach.
 
 /// Every model id yoyo can route to a yoagent preset. There is NO single
 /// registry that lists them: `anthropic_preset` matches by `starts_with` and

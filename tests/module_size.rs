@@ -510,7 +510,12 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // 429 lines of ratchet slack the warning branch never got anyone to close.
     // Day 215: 3790 -> 3792 (+2, the two stdout writes now pass through
     // `stream_leading_blank::filter_stdout`; the logic lives in its own module).
-    ("src/prompt.rs", 3792),
+    // Day 225 (#1007): 3792 -> 3906. +100 had accumulated unrecorded in the
+    // grace band since Day 215 (the file sat at exactly 3892, the band's edge);
+    // +14 is the yoagent 0.25.2 upgrade: two rate-limit rows pinning 0.25's new
+    // `Rate limited` Display shapes in the emission-point table, plus a 3-line
+    // superseded note. They belong in that table, so the entry is raised.
+    ("src/prompt.rs", 3906),
     // Day 183: first entry for this file — 2042, i.e. 42 past MAX_MODULE_LINES and
     // so inside OVERSHOOT_GRACE_LINES, which is why it warned instead of failing.
     // Registering it is this gate's OWN stated remedy for a grace-band overshoot

@@ -51,6 +51,9 @@ pub(super) fn should_retry_after_partial(
 /// Overloaded onto this door: an opted-in loop would have lost the turn again
 /// (the Day-219 loss). The upgrade needed a decision before #991, so the door
 /// now reads the opt-in. Default (off) is unchanged: it still aborts (#989).
+/// That upgrade landed Day 225 (#1007): 0.25.2's `ProviderError::classify`
+/// sends 529 and in-stream `overloaded_error` to the retried `RateLimited`
+/// (`provider/traits.rs:299-306`, `:435`), so the reclassification is live.
 pub(super) fn retry_after_partial_allowed(
     opted_in: bool,
     stdout_is_terminal: bool,

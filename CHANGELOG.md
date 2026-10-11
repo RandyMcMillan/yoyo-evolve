@@ -6,6 +6,7 @@ This project is a self-evolving coding agent — every change was planned, imple
 
 ## [Unreleased]
 
+- yoagent 0.24.2 → 0.25.2 (#1007). Sub-agent bash (yoagent's `BashTool`) now kills its whole process group on timeout or cancel, so pipeline stages and background jobs no longer keep running after the child gives up. On Unix the terminal's Ctrl+C no longer reaches a sub-agent's running command directly; it is stopped through the run's cancel instead. Model prices are now opt-in upstream, and yoyo turns on yoagent's bundled price table itself, so `/cost` reads the same preset prices as before.
 - A single prompt is no longer silently stopped at 1,000,000 cumulative tokens (about turn 16 at a 60K context; observed `Max tokens reached (1061497/1000000)`) or after 10 minutes of wall clock (an inherited yoagent default). It is now bounded by `--max-turns` (default 200) and loop detection (#999). Sub-agents keep yoagent's built-in caps for now.
 - yoagent 0.24.1 → 0.24.2 (security release, #996): a `search` pattern starting with `-` (e.g. `--pre=<cmd>`, which made ripgrep run a command) is now searched as a literal; pinned for both the parent and sub-agent `search` tools in `src/tools_search_flag_tests.rs`.
 - `-p` / piped prompt interrupted by Ctrl+C (SIGINT) now exits 130 and writes `(interrupted)` to stderr instead of the REPL's "press Ctrl+C again" hint to stdout (#993).

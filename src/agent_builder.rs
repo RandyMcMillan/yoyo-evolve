@@ -744,6 +744,23 @@ pub(crate) fn insert_client_headers(config: &mut ModelConfig) {
     }
 }
 
+/// yoagent 0.25 made model pricing opt-in: every `ModelConfig` constructor
+/// leaves `cost` as `None` until `yoagent::provider::prices::enable_bundled()`
+/// has run, and the bundled table only reaches configs built AFTER that call.
+/// So the call lives here, on the constructor path every preset goes through
+/// (`anthropic_preset`, `openai_preset`, `create_model_config`), rather than in
+/// `main`: unit tests never run `main`, and a startup-only call would leave
+/// every test that reads a preset's price reading `None`. `Once` keeps it to a
+/// single install per process; `enable_bundled` is itself idempotent, so the
+/// `Once` is only there to skip the table resolve on every preset lookup.
+/// Bundled only, never `enable_live`: no network at config time (#1007).
+fn ensure_bundled_prices() {
+    static BUNDLED: std::sync::Once = std::sync::Once::new();
+    BUNDLED.call_once(|| {
+        let _ = yoagent::provider::prices::enable_bundled();
+    });
+}
+
 /// Look up a yoagent 0.9 fleet preset for an Anthropic model name.
 ///
 /// The fleet models (claude-fable-5, claude-opus-5, claude-opus-4-8,
@@ -756,6 +773,7 @@ pub(crate) fn insert_client_headers(config: &mut ModelConfig) {
 /// Returns `None` for non-fleet models — callers fall back to
 /// `ModelConfig::anthropic` (yoagent's generic Anthropic defaults).
 pub fn anthropic_preset(model: &str) -> Option<ModelConfig> {
+    ensure_bundled_prices();
     // Most-specific first (#1003): `claude-opus-5-5` also starts with
     // `claude-opus-5`, and `cost` is priced from the constructor's own id.
     let mut config = if model.starts_with("claude-fable-5-1") {
@@ -786,7 +804,7 @@ pub fn anthropic_preset(model: &str) -> Option<ModelConfig> {
     Some(config)
 }
 
-/// Claude Sonnet 5.5 — yoagent 0.24.2 ships no constructor and no `prices.json`
+/// Claude Sonnet 5.5 — yoagent 0.24.2 (and 0.25.2, re-checked #1007) ships no constructor and no `prices.json`
 /// row, so it used to resolve through `claude_sonnet_5()` and bill cache reads
 /// at $0.20/M. Rates from models.dev's `claude-sonnet-5-5` row (Day 224: $2 in,
 /// $10 out, $0.10 cache read, $2.50 cache write; no long-context tier), the
@@ -804,7 +822,7 @@ pub(crate) fn claude_sonnet_5_5() -> ModelConfig {
     config
 }
 
-/// Claude Haiku 5.5 — yoagent 0.24.2 ships no preset (and no price-table row)
+/// Claude Haiku 5.5 — yoagent 0.24.2 (and 0.25.2, re-checked #1007) ships no preset (and no price-table row)
 /// for it, so without this arm it got the generic 200K config and `/cost`
 /// fell through to the Haiku 3.5 row, overstating its bill about 8x.
 ///
@@ -857,6 +875,7 @@ pub(crate) fn claude_haiku_5_5() -> ModelConfig {
 /// sibling (the #1003 misbill class). Unknown ids stay `None` so the caller
 /// keeps the generic `ModelConfig::openai` defaults.
 pub fn openai_preset(model: &str) -> Option<ModelConfig> {
+    ensure_bundled_prices();
     match model {
         "gpt-6-astra" => Some(ModelConfig::gpt_6_astra()),
         "gpt-6-sol" => Some(ModelConfig::gpt_6_sol()),
@@ -924,6 +943,7 @@ pub fn normalize_anthropic_base_url(url: &str) -> String {
 
 /// Create a ModelConfig for a provider, honoring an optional custom base URL.
 pub fn create_model_config(provider: &str, model: &str, base_url: Option<&str>) -> ModelConfig {
+    ensure_bundled_prices();
     let mut config = match provider {
         "anthropic" => {
             // Fleet preset (pricing/context truth) or generic Anthropic config.
@@ -1320,7 +1340,10 @@ pub(crate) fn anthropic_output_maximum(model: &str) -> Option<u32> {
 /// Opt-in bounds (a duration or dollar budget flag) are a separate decision.
 /// Sub-agents are NOT covered here: their limits are hard-coded inside
 /// yoagent 0.24.2's `SubAgentTool` (1M tokens, 300 s); yoagent#238 makes them
-/// settable and ships in 0.24.3, which yoyo does not use yet.
+/// settable and ships in 0.24.3. Superseded (0.25.2 upgrade, Day 225, #1007):
+/// yoyo now resolves 0.25.2, where `SubAgentTool::with_execution_limits` exists
+/// (`sub_agent.rs:447`), but no yoyo call site adopts it, so sub-agents still
+/// run on those defaults. Adopting it is a separate decision.
 pub(crate) fn main_agent_execution_limits(max_turns: Option<usize>) -> ExecutionLimits {
     ExecutionLimits::default()
         .with_max_turns(max_turns.unwrap_or(200))
@@ -2112,7 +2135,7 @@ mod tests {
         // models/overview (1M context, 128K max output) and .../pricing
         // ($0.10 in, $0.125 5m cache write, $0.01 cache hit, $0.50 out;
         // above 100,000 prompt tokens $0.50 / $0.625 / $0.05 / $2.50).
-        // models.dev agreed on every number. yoagent 0.24.2 has no preset.
+        // models.dev agreed on every number. yoagent 0.24.2 and 0.25.2 have no preset.
         let preset = anthropic_preset("claude-haiku-5-5")
             .expect("claude-haiku-5-5 must resolve to a preset, not the generic 200K config");
         assert_eq!(preset.id, "claude-haiku-5-5");

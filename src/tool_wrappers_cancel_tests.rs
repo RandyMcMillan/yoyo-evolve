@@ -1,8 +1,8 @@
 //! #988 Q3: a sub-agent child cancelled by Ctrl-C must not be re-run on the
 //! fallback model, and the parent's model must not be told it "failed".
 //!
-//! **The exact string, read from yoagent 0.24.2's source rather than the issue**
-//! <!-- yoagent-version-claim: 0.24.2 -->: a cancelled run ends as
+//! **The exact string, read from yoagent 0.24.2's source rather than the issue**:
+//! a cancelled run ends as
 //! `StopReason::Aborted` (`agent_loop.rs`: `ProviderError::Cancelled` *or*
 //! `cancel.is_cancelled()` turns the failed message into `Aborted`), and
 //! `sub_agent.rs`'s `extract_error` returns the message's `error_message` —
@@ -10,6 +10,25 @@
 //! back to the literal `"Cancelled"` — which `execute` wraps as
 //! `ToolError::Failed("Sub-agent '{name}' failed: Cancelled")`. A hung tool
 //! source returns the payload-less `ToolError::Cancelled` instead.
+//!
+//! **Superseded claim (0.25.2 upgrade, Day 225, #1007), recorded rather than
+//! erased:** the paragraph above was the whole list of spellings in 0.24.2. In
+//! 0.25.2 (`sub_agent.rs:720-737`, `extract_error` at `:774`) there are two
+//! more, and the `"... failed: Cancelled"` one is no longer the common case:
+//! - a child cancelled **before its model answered at all** now returns the
+//!   payload-less `ToolError::Cancelled` (not only a hung tool source);
+//! - a cancel that lands **between provider calls** leaves
+//!   `agent_loop::CANCELLED_MARKER` (`"[Agent stopped: cancelled]"`) as the last
+//!   user message, which `extract_error` returns, so the error reads
+//!   `"Sub-agent '{name}' failed: [Agent stopped: cancelled]"`.
+//!
+//! Nothing in the decorators changes, because they never keyed on the spelling
+//! (next paragraph); `marker_spelled_cancel_reads_as_cancelled_through_the_full_stack`
+//! pins the new spelling through the same stack, built from the upstream const
+//! by reference. It also shows `SubAgentOutputMarkerTool`'s PARTIAL notice
+//! cannot fire on it: the marker shares `AGENT_STOPPED_PREFIX` but arrives as
+//! `Err`, never `Ok`.
+//! <!-- yoagent-version-claim: 0.25.2 -->
 //!
 //! **What the spelling cannot carry.** `agent_loop.rs` marks a run `Aborted`
 //! whenever the token is cancelled, *whatever* the provider error was, so a
@@ -43,7 +62,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use yoagent::types::{AgentTool, ToolContext, ToolError, ToolResult};
 
-/// The exact error yoagent 0.24.2 builds for a cancelled child named `sub_agent`.
+/// The error yoagent 0.24.2 built for a cancelled child named `sub_agent` (0.25.2 still
+/// builds it for an `Aborted` run; the module doc lists its two newer spellings).
 const CANCELLED: &str = "Sub-agent 'sub_agent' failed: Cancelled";
 /// A cancel that raced a provider failure: `Aborted`, with the provider's text.
 const CANCEL_RACED_404: &str = "Sub-agent 'sub_agent' failed: API error 404: model not found";
@@ -276,4 +296,32 @@ async fn full_stack_cancel_is_neither_rerun_nor_called_a_failure() {
     let text = err_text(tool.execute(serde_json::json!({}), cancelled_ctx()).await);
     assert_eq!(s_calls.load(Ordering::SeqCst), 0);
     assert_eq!(text, sub_agent_cancelled_report(LABEL, CANCEL_RACED_404));
+}
+
+#[tokio::test]
+async fn marker_spelled_cancel_reads_as_cancelled_through_the_full_stack() {
+    // yoagent 0.25: a cancel between provider calls is spelled with the loop's
+    // own stop marker. Built from the const so an upstream rename is visible.
+    let msg: &'static str = Box::leak(
+        format!(
+            "Sub-agent 'sub_agent' failed: {}",
+            yoagent::agent_loop::CANCELLED_MARKER
+        )
+        .into_boxed_str(),
+    );
+    // Anti-vacuous: the fixture really carries the marker shape it claims.
+    assert!(msg.contains(yoagent::agent_loop::AGENT_STOPPED_PREFIX));
+    let (p, _) = stub(Reply::Failed(msg));
+    let (s, s_calls) = stub(Reply::Ok);
+    let tool = SubAgentOutputMarkerTool::new(Box::new(DiagnosticSubAgentTool::new(
+        Box::new(FallbackSubAgentTool::new(p, s, "dead-model", "live-model")),
+        LABEL,
+    )));
+    let text = err_text(tool.execute(serde_json::json!({}), cancelled_ctx()).await);
+    assert_eq!(
+        s_calls.load(Ordering::SeqCst),
+        0,
+        "a cancel must not re-run"
+    );
+    assert_eq!(text, sub_agent_cancelled_report(LABEL, msg));
 }

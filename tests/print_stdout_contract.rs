@@ -966,8 +966,18 @@ fn opt_in_death_before_text_still_yields_exactly_the_answer() {
 }
 
 /// Day-216 row: the case the widened retry does NOT save. Every attempt dies
-/// after streaming text; the opt-in must still terminate, nonzero, within the
-/// existing retry cap (6 attempts = MAX_RETRIES + 1), never loop.
+/// after streaming text; the opt-in must still terminate, nonzero, bounded,
+/// never loop.
+///
+/// Superseded reading (yoagent 0.25.2 upgrade, Day 225, #1007), recorded rather
+/// than erased: this row pinned 6 requests (MAX_RETRIES + 1). The fixture dies
+/// with an in-stream `overloaded_error`, which yoagent >= 0.24.3 classifies as
+/// a retried `RateLimited` (`provider/traits.rs:435`). So the death now goes
+/// through yoagent's own retry first (1 + `RetryConfig::default`'s 3) and only
+/// then reaches yoyo's 6 attempts: 24 requests, measured. This is the same
+/// worst case `opt_in_provider_retry_every_attempt_dying_still_exits_nonzero`
+/// already pins for `rate_limit_error`, as `retry_after_partial.rs` predicted.
+/// Opt-in only: with the default (off) the #989 rows above stay at 1 request.
 #[test]
 fn opt_in_every_attempt_dying_after_text_terminates_nonzero_within_the_cap() {
     let run = run_opt_in(vec![sse_dies_mid_stream_body_with(PARTIAL_LINE)]);
@@ -977,18 +987,29 @@ fn opt_in_every_attempt_dying_after_text_terminates_nonzero_within_the_cap() {
         run.stderr
     );
     assert_eq!(
-        run.requests, 6,
-        "bounded by MAX_RETRIES + 1; stderr={}",
+        run.requests, 24,
+        "bounded: 4 yoagent attempts x 6 yoyo attempts; stderr={}",
         run.stderr
     );
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
-        [PARTIAL_LINE; 6].join("\n\n"),
-        "the cost of the opt-in at its worst: one partial per attempt; stderr={}",
+        [PARTIAL_LINE; 24].join("\n\n"),
+        "the cost of the opt-in at its worst: one partial per request; stderr={}",
         run.stderr
     );
     assert!(
-        run.stderr.contains("Overloaded"),
+        run.stderr.contains("failed after 6 attempts"),
+        "yoyo's own cap still reported; stderr={}",
+        run.stderr
+    );
+    // Superseded claim (0.25.2 upgrade, Day 225, #1007), recorded rather than
+    // erased: this asserted stderr contains "Overloaded" — the provider's own
+    // message. yoagent 0.25.2 reclassifies the in-stream `overloaded_error`
+    // as `RateLimited`, which carries no message (yoagent CHANGELOG: "its
+    // text now reads 'Rate limited'"), so the server's text no longer reaches
+    // yoyo. The failure is still on stderr, under its new classification.
+    assert!(
+        run.stderr.contains("Rate limited"),
         "stderr carries the failure; stderr={}",
         run.stderr
     );
@@ -1557,6 +1578,8 @@ fn assert_partial_retry_reading(run: &Run) {
 // never sees the dying attempt. yoagent >= 0.24.3 moves Anthropic 529 /
 // `overloaded_error` onto this same classification, which is why this door
 // must honour the opt-in before that upgrade.
+// That upgrade landed Day 225 (#1007, yoagent 0.25.2); `is_retryable` is
+// unchanged there (retry.rs:70) and the 529 reclassification is now live.
 
 fn rate_limited_after(partial: &str) -> String {
     sse_partial_then(

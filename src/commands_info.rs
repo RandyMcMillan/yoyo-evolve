@@ -338,7 +338,7 @@ pub fn context_breakdown(messages: &[AgentMessage]) -> ContextBreakdown {
                     tool_results += content_block_tokens(content) + estimate_tokens(tool_name) + 8;
                 }
             },
-            AgentMessage::Extension(ext) => {
+            AgentMessage::Custom(ext) => {
                 // Count extensions toward user messages as a catch-all
                 user_messages += estimate_tokens(&ext.data.to_string()) + 4;
             }

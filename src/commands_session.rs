@@ -615,7 +615,7 @@ pub fn handle_history_detail(agent: &Agent) {
                     turns.push((None, vec![m]));
                 }
             }
-            AgentMessage::Extension(_) => {}
+            AgentMessage::Custom(_) => {}
         }
     }
 
@@ -879,7 +879,7 @@ pub fn format_conversation_as_markdown(messages: &[AgentMessage]) -> String {
                     out.push_str("\n```\n\n");
                 }
             }
-            AgentMessage::Extension(_) => {} // skip extension messages
+            AgentMessage::Custom(_) => {} // skip extension messages
         }
     }
 

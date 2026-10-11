@@ -1938,7 +1938,19 @@ pub(crate) fn build_explore_agent_tool(
 /// dispatch — the schema is still `{"task"}` only, and the #881 conclusion stands. Citations
 /// above were re-pointed to 0.24.0 line numbers.
 ///
-/// <!-- yoagent-version-claim: 0.24.2 -->
+/// Superseded claim (0.25.2 upgrade, Day 225, #1007), recorded rather than erased: the
+/// paragraph above says a per-delegation tool hook "sees neither the task nor any per-call
+/// parameter". That stays true of `ToolSource`, but 0.25 adds a second hook that does see the
+/// task: an `Extension` installed with `SubAgentTool::with_extension` /
+/// `with_tree_extension` gets `RunHooks::tools(&mut self, run: &RunContext)` once per run
+/// (`extension.rs:427`), and `RunContext::prompts` is "for a delegated run: its task"
+/// (`extension.rs:163-165`). So a hook can now ADD tools keyed on the task text. The #881
+/// conclusion still stands for what #881 asked: the hook only extends the list (it cannot
+/// remove a static tool), and `parameters_schema` is still the `{"task"}` literal
+/// (`sub_agent.rs:513-524`), so a model still cannot send a per-dispatch `read_only`
+/// argument. #881 is closed anyway, by a second dispatch tool (`explore_agent`, below).
+///
+/// <!-- yoagent-version-claim: 0.25.2 -->
 /// What distinguishes yoyo's two dispatch tools from each other: the name the
 /// parent model sees, and the sentence it is given about the tool.
 ///

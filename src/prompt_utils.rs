@@ -87,7 +87,7 @@ fn message_text(msg: &AgentMessage) -> String {
                 .join(" ");
             format!("{tool_name} {text}")
         }
-        AgentMessage::Extension(ext) => ext.role.clone(),
+        AgentMessage::Custom(ext) => ext.role.clone(),
     }
 }
 
@@ -384,7 +384,7 @@ pub fn summarize_message(msg: &AgentMessage) -> (&str, String) {
             let status = if *is_error { "✗" } else { "✓" };
             ("tool", format!("{tool_name} {status}"))
         }
-        AgentMessage::Extension(ext) => ("ext", truncate_with_ellipsis(&ext.role, 60)),
+        AgentMessage::Custom(ext) => ("ext", truncate_with_ellipsis(&ext.role, 60)),
     }
 }
 

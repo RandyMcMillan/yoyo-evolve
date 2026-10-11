@@ -2991,7 +2991,11 @@ mod tests {
     /// session — `Rate limited, retry after Some(14454000)ms` — which matches
     /// `#[error("Rate limited, retry after {retry_after_ms:?}ms")]` exactly,
     /// including the `Some(..)` that only a `{:?}` of an `Option` produces.
-    /// <!-- yoagent-version-claim: 0.24.2 -->
+    ///
+    /// **Superseded (0.25.2, Day 225, #1007), recorded rather than erased:** 0.25.2
+    /// renders `Rate limited, retry after 14454000ms` (no `Some(..)`), or a bare
+    /// `Rate limited` with no hint (`provider/traits.rs:262`); both are rows below.
+    /// <!-- yoagent-version-claim: 0.25.2 -->
     #[test]
     fn stream_cut_off_mid_answer_is_retriable_not_fatal() {
         // (shape, expected verdict, why)
@@ -3048,6 +3052,16 @@ mod tests {
                 Some("Rate limited, retry after Some(14454000)ms"),
                 "RetriableError",
                 "CLAUDE.md's verbatim real-session string",
+            ),
+            (
+                Some("Rate limited, retry after 14454000ms"),
+                "RetriableError",
+                "yoagent 0.25 Display with a retry-after hint (no Some(..))",
+            ),
+            (
+                Some("Rate limited"),
+                "RetriableError",
+                "yoagent 0.25 Display with no retry-after hint at all",
             ),
         ];
 
