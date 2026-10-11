@@ -1578,12 +1578,14 @@ pub(crate) fn read_only_child_disallowed(base: &[String]) -> Vec<String> {
 /// The one user-deny predicate and refusal text, read by the parent's
 /// `StreamingBashTool::execute` and the child's `UserDenyBashTool`.
 pub(crate) fn user_deny_refusal(user_deny: &[String], command: &str) -> Option<String> {
-    let pattern = user_deny
-        .iter()
-        .find(|p| crate::config::glob_match(p, command))?;
-    Some(format!(
-        "Command blocked by your permission rules: matches deny pattern '{pattern}'."
-    ))
+    let glob = crate::config::glob_match;
+    if let Some(pattern) = user_deny.iter().find(|p| glob(p, command)) {
+        return Some(format!(
+            "Command blocked by your permission rules: matches deny pattern '{pattern}'."
+        ));
+    }
+    // #1010: each segment, assignments stripped; then indirect command words.
+    crate::safety::user_deny_spelling_refusal(user_deny, command, glob)
 }
 
 // The hard deny list and its token-aware predicate live in `hard_deny.rs`;

@@ -205,3 +205,114 @@ fn both_child_builders_pass_the_users_deny_list() {
     let needle = ["&config.permissions", ".deny,"].concat();
     assert_eq!(prod.matches(needle.as_str()).count(), 2, "{needle}");
 }
+
+/// #1010: the deny list is the one fence that holds under `--yes`, `-p` and
+/// "always", and it used to be one whole-string glob against the command as
+/// the model spelled it. The property pinned here: no command a deny pattern
+/// blocks when written plainly may run because of how it was spelled.
+/// Spelling normalisation plus refusal of what cannot be normalised, not a
+/// shell interpreter (`eval "$(printf ...)"` assembling a string is not seen).
+#[test]
+fn user_deny_checks_each_segment_and_refuses_indirect_words() {
+    use crate::tools::user_deny_refusal;
+    let list = vec!["rm -rf *".to_string()];
+    let must_refuse = [
+        "rm -rf ~",
+        "cd x && rm -rf ~",
+        "true; rm -rf ~",
+        "ls | rm -rf ~",
+        "TZ=\"$HOME\" rm -rf build",
+        "A=1 B=2 rm -rf ~",
+        "export A=1 && rm -rf ~",
+        "if true; then rm -rf ~; fi",
+        "X=rm; $X -rf ~",
+        "$(echo rm) -rf ~",
+        "`echo rm` -rf ~",
+        "BASH_ARGV0=rm; $BASH_ARGV0 -rf ~",
+    ];
+    for cmd in must_refuse {
+        assert!(
+            user_deny_refusal(&list, cmd).is_some(),
+            "{cmd:?} must be refused by deny 'rm -rf *'"
+        );
+    }
+    // Near-misses: the regression surface. Quoted prose is one word to the
+    // quote-aware lexer, so `;` / `&&` inside quotes never start a segment.
+    let must_allow = [
+        "cargo build && cargo test",
+        "echo \"rm -rf ~\"",
+        "git commit -m \"x; rm -rf ~\"",
+        "rm file.txt",
+        "X=1 cargo build",
+        "export PATH=/x:$PATH && cargo build",
+        "cat <<EOF\nrm -rf ~\nEOF",
+    ];
+    for cmd in must_allow {
+        assert_eq!(user_deny_refusal(&list, cmd), None, "{cmd:?} must pass");
+    }
+}
+
+/// The two refusal reasons are distinguishable, and the segment that matched
+/// is named so the user can see which part of a compound tripped the rule.
+#[test]
+fn user_deny_refusal_names_segment_or_expansion() {
+    use crate::tools::user_deny_refusal;
+    let list = vec!["rm -rf *".to_string()];
+    let seg = user_deny_refusal(&list, "cd x && rm -rf ~").unwrap();
+    assert_eq!(
+        seg,
+        "Command blocked by your permission rules: the part `rm -rf ~` matches deny pattern 'rm -rf *'."
+    );
+    let ind = user_deny_refusal(&list, "X=rm; $X -rf ~").unwrap();
+    assert!(ind.contains("`$X`"), "{ind}");
+    assert!(ind.contains("write the command plainly"), "{ind}");
+    assert!(!ind.contains("matches deny pattern"), "{ind}");
+    // The original whole-string refusal text is unchanged for a plain hit.
+    assert_eq!(
+        user_deny_refusal(&list, "rm -rf ~").unwrap(),
+        "Command blocked by your permission rules: matches deny pattern 'rm -rf *'."
+    );
+    // A hostile control byte in the model's spelling never reaches the text raw.
+    let hostile = user_deny_refusal(&list, "cd x && rm -rf ~\u{1b}[2J").unwrap();
+    assert!(
+        "cd x && rm -rf ~\u{1b}[2J".as_bytes().contains(&0x1b),
+        "fixture carries the hostile byte"
+    );
+    assert!(!hostile.as_bytes().contains(&0x1b), "{hostile:?}");
+}
+
+/// No deny list -> byte-identical to before: nothing is refused, including the
+/// indirect spellings. With a deny list, `"$CARGO" build` IS refused. That is
+/// the trade #1010 left open, decided here: a user who wrote a deny list asked
+/// for a fence, and a fence any `$VAR` walks through is not one. The refusal
+/// says how to proceed (write the command plainly). Users without a deny list,
+/// including this repo's own evolve loop (its `.yoyo.toml` sets none), are
+/// outside the narrowed population.
+#[test]
+fn indirect_command_word_refused_only_when_a_deny_list_exists() {
+    use crate::tools::user_deny_refusal;
+    let empty: Vec<String> = vec![];
+    for cmd in [
+        "\"$CARGO\" build",
+        "X=rm; $X -rf ~",
+        "$(echo rm) -rf ~",
+        "cd x && rm -rf ~",
+        "rm -rf ~",
+    ] {
+        assert_eq!(user_deny_refusal(&empty, cmd), None, "{cmd:?}");
+    }
+    let list = vec!["rm -rf *".to_string()];
+    assert!(user_deny_refusal(&list, "\"$CARGO\" build").is_some());
+}
+
+/// Stated limit, pinned so it cannot be mistaken for coverage: a command
+/// string assembled at runtime and run as `eval "$(...)"` is NOT refused,
+/// because the analyser's `eval "$(tool)"` exemption is kept. Tracked in #1011 (the
+/// #1010 residue); whoever closes it flips this assertion.
+#[test]
+fn eval_of_an_assembled_command_string_is_a_stated_limit() {
+    use crate::tools::user_deny_refusal;
+    let list = vec!["rm -rf *".to_string()];
+    let assembled = "eval \"$(printf '%s %s %s' rm -rf ~)\"";
+    assert_eq!(user_deny_refusal(&list, assembled), None);
+}

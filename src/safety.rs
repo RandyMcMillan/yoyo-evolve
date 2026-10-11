@@ -32,6 +32,7 @@
 use std::sync::LazyLock;
 
 mod indirect_command;
+pub(crate) use indirect_command::user_deny_spelling_refusal;
 
 use regex::Regex;
 

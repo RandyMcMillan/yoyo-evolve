@@ -46,7 +46,7 @@ yoyo --allow "git *" --allow "cargo *" --deny "rm -rf *"
 
 ### How it works
 
-1. **Deny is checked first.** If a command matches any `--deny` pattern, it's rejected immediately — the agent sees an error message and must try something else. For bash this holds on every approval path: under `--yes`, after an "always" answer, and for commands yoyo's safety analyzer would otherwise warn about. The pattern is matched against the command exactly as the agent wrote it.
+1. **Deny is checked first.** If a command matches any `--deny` pattern, it's rejected immediately — the agent sees an error message and must try something else. For bash this holds on every approval path: under `--yes`, after an "always" answer, and for commands yoyo's safety analyzer would otherwise warn about. The pattern is matched against the whole command and also against each part of a compound command (split at `;`, `&&`, `||`, `|` and newlines, but never inside quotes), with leading `VAR=value` assignments and `export`/`declare`/`local` prefixes ignored, so `cd x && rm -rf build` and `TZ=UTC rm -rf build` both hit `rm -rf *`. When a deny list is set, a command whose program name comes from a shell expansion (`$VAR`, `$(...)` or backticks, e.g. `"$CARGO" build`) is refused, because the deny list cannot check a name it cannot see; write the command plainly instead. Limit: this is spelling normalisation, not a shell interpreter. A command string assembled at runtime and run via `eval "$(...)"` is not seen.
 2. **Allow is checked second.** If a command matches any `--allow` pattern, it runs without prompting.
 3. **No match = prompt.** Commands that don't match either list get the normal `[y/N]` prompt.
 

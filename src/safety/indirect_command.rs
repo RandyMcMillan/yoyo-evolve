@@ -343,6 +343,88 @@ pub(super) fn check_indirect_command_word(cmd: &str, _cmd_lower: &str) -> Option
     None
 }
 
+/// Declaration builtins whose arguments are assignments, not a command
+/// (`export A=1 && rm …` — the `export` segment runs nothing).
+const DECLARATION_KEYWORDS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
+
+/// #1010: the command segments a user deny pattern is matched against, as the
+/// shell would run them. Quote-aware (the same lexer as the analyser, so
+/// `echo "a; rm …"` is ONE segment) and heredoc bodies are dropped unless they
+/// feed a shell. Per segment, leading `NAME=value` words, a leading
+/// declaration keyword with its flags/assignments, and command-position
+/// keywords (`if`, `then`, `{` …) are stripped; a segment left empty runs
+/// nothing and is omitted. Spelling normalisation, not interpretation.
+fn deny_segments(cmd: &str) -> Vec<String> {
+    let cmd = strip_heredoc_bodies(cmd);
+    let mut out = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut in_decl = false;
+    let push = |cur: &mut Vec<String>, out: &mut Vec<String>| {
+        if !cur.is_empty() {
+            out.push(std::mem::take(cur).join(" "));
+        }
+    };
+    for tok in lex_shell_words(&cmd) {
+        match tok {
+            ShellToken::Boundary => {
+                push(&mut cur, &mut out);
+                in_decl = false;
+            }
+            ShellToken::Word(w) => {
+                if cur.is_empty() {
+                    if in_decl || COMMAND_POSITION_KEYWORDS.contains(&w.as_str()) {
+                        // `export -n A=1 B`: the whole segment declares.
+                        continue;
+                    }
+                    if is_shell_assignment(&w) {
+                        continue;
+                    }
+                    if DECLARATION_KEYWORDS.contains(&w.as_str()) {
+                        in_decl = true;
+                        continue;
+                    }
+                }
+                cur.push(w);
+            }
+        }
+    }
+    push(&mut cur, &mut out);
+    out
+}
+
+/// #1010: the part of the user deny check that the whole-string glob cannot
+/// do. Called only after that glob found nothing and only with a non-empty
+/// deny list. (1) Each segment from [`deny_segments`] is matched against each
+/// pattern — catches `cd x && rm …`, `TZ=… rm …`. (2) Otherwise, a command
+/// word the analyser cannot read (`$X`, `$(…)`, backticks) is refused: a deny
+/// list cannot check a program name it cannot see, and a fence any `$VAR`
+/// walks through is not a fence. Not seen: `eval "$(printf …)"` assembling a
+/// command string (the analyser's `eval` exemption is kept). Model-supplied
+/// text in the message is sanitized for the terminal.
+pub(crate) fn user_deny_spelling_refusal(
+    user_deny: &[String],
+    command: &str,
+    glob_match: impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    if user_deny.is_empty() {
+        return None;
+    }
+    for seg in deny_segments(command) {
+        if let Some(p) = user_deny.iter().find(|p| glob_match(p, &seg)) {
+            let shown = crate::cli::sanitize_for_display(&seg);
+            return Some(format!(
+                "Command blocked by your permission rules: the part `{shown}` matches deny pattern '{p}'."
+            ));
+        }
+    }
+    let reason = check_indirect_command_word(command, "")?;
+    Some(format!(
+        "Command blocked by your permission rules: {}. A deny list cannot check a program \
+         name that comes from a shell expansion ($X, $(...), backticks); write the command plainly.",
+        crate::cli::sanitize_for_display(&reason)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::analyze_bash_command;
