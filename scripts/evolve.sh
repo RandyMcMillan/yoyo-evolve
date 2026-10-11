@@ -643,8 +643,17 @@ run_agent_with_fallback() {
 #   line start, so it missed every real failure. Days 210-211 ran with 7
 #   HTTP 404s per session and no abort, while matching raw JSONL an agent
 #   printed.
+#
+# Also matched (#916): the line yoyo prints whenever it gives up on the
+# provider with no fallback, `  API error with no fallback configured.
+# Exiting.` (src/agent_builder.rs, try_fallback_prompt). It follows EVERY
+# terminal provider failure, including the ones whose own line is not tagged
+# `API error:`, e.g. `error: Rate limited, retry after …` (Day 195: five
+# sessions refused on every call, zero detections) and `error: Network error:`.
+# Anchored at line start like the first form, so reading the source line that
+# prints it (`eprintln!("{RED}  API error with no fallback…`) never matches.
 agent_log_has_api_error() {
-    grep -qE $'^(\e\\[[0-9;]*m)?[[:space:]]*error: (API|Auth) error: ' "$1" 2>/dev/null
+    grep -qE $'^(\e\\[[0-9;]*m)?[[:space:]]*(error: (API|Auth) error: |API error with no fallback configured\\. Exiting\\.)' "$1" 2>/dev/null
 }
 
 # ── Scope gate for the two ungated `git add -A` sweeps (#951) ──
@@ -707,6 +716,76 @@ commit_scope_gate() { # $1 = allowed-path ERE, $2 = label for messages/files
 }
 WRAPUP_SCOPE='^(journals|memory|session_plan|\.yoyo)/'
 PREPUSH_SCOPE='^\.yoyo/'
+
+# ── Revert receipt (one writer for every task-revert path, #916) ──
+# Reads the task globals (DAY, TASK_NUM, task_title, task_issue, TASK_DESC)
+# and the revert globals (REVERT_CLASS, REVERT_REASON, REVERT_DETAILS) at call
+# time. The class goes in the title; the planner reads titles only.
+file_revert_receipt() {
+    if [ "$QUIET_MODE" = false ] && command -v gh &>/dev/null; then
+        # The GitHub App token expires after 60 minutes; a revert deep in
+        # a long session (Day 160: T+94min) fails auth with the startup
+        # token. Refresh before filing — otherwise the receipt vanishes
+        # and the next planner never learns to shrink the task.
+        refresh_gh_token
+        # The class goes in the TITLE, not just the body. The planner's
+        # revert fetch is `--json number,title` (titles only, by design —
+        # see the comment there), and the planner's response is keyed off
+        # that class: plain → plan it smaller; no-progress → find the
+        # blocker first, because the task stalled on something outside the
+        # diff and a smaller version stalls identically. A class buried in a
+        # body the fetch never reads cannot drive that choice.
+        ISSUE_TITLE="Task reverted${REVERT_CLASS:-}: ${task_title:0:180}"
+        ISSUE_BODY="**Day $DAY, Task $TASK_NUM** was automatically reverted by the harness (the reason below says which gate).
+${task_issue:+
+**Parent issue:** #$task_issue (first issue named by the task spec) — if every issue this task served is closed, this receipt is history and should be closed too.
+}
+**Reason:** $REVERT_REASON
+
+**Error details:**
+${REVERT_DETAILS:-no details captured}
+
+**What was attempted:**
+$TASK_DESC"
+
+        # Check for existing issue to avoid duplicates. A failed query
+        # must not silently degrade to duplicate filing (review finding
+        # — #667-#670 shows what duplicate receipts cost); warn and
+        # proceed as no-match, which is the least-bad recovery.
+        if ! EXISTING_ISSUE=$(gh issue list --repo "$REPO" --state open \
+            --label "agent-revert" --search "Task reverted: ${task_title}" \
+            --json number --jq '.[0].number' 2>&1); then
+            echo "    WARNING: receipt dedup query failed ($(echo "$EXISTING_ISSUE" | head -1)) — may file a duplicate."
+            EXISTING_ISSUE=""
+        fi
+
+        if [ -n "$EXISTING_ISSUE" ]; then
+            if gh issue comment "$EXISTING_ISSUE" --repo "$REPO" \
+                --body "Reverted again on Day $DAY. Reason: $REVERT_REASON
+
+**Error details:**
+${REVERT_DETAILS:-no details captured}" 2>/dev/null; then
+                echo "    Updated existing issue #$EXISTING_ISSUE"
+            else
+                echo "    WARNING: Could not comment on issue #$EXISTING_ISSUE"
+            fi
+        else
+            # Success prints the URL (the old >/dev/null made a filed
+            # receipt invisible — review finding); failure prints the
+            # real stderr instead of a bare WARNING.
+            CREATE_ERR_F=$(mktemp)
+            if CREATE_URL=$(gh issue create --repo "$REPO" \
+                --title "$ISSUE_TITLE" \
+                --body "$ISSUE_BODY" \
+                --label "agent-revert" 2>"$CREATE_ERR_F"); then
+                echo "    Filed revert receipt: $CREATE_URL"
+            else
+                echo "    WARNING: Could not file revert issue: $(head -1 "$CREATE_ERR_F")"
+            fi
+            rm -f "$CREATE_ERR_F"
+        fi
+    fi
+}
 
 # ── Keep a reverted task's work (#997) ──
 # Both task-revert paths end in `git reset --hard "$PRE_TASK_SHA"`, which
@@ -1620,7 +1699,7 @@ $SELF_ISSUES
 ${RECENT_REVERTS:+
 === RECENTLY REVERTED (auto-filed receipts, not your backlog) ===
 Tasks the verification gate reverted. Nobody wrote these — the harness files them.
-This block lists titles only. The title carries the revert CLASS, and the four
+This block lists titles only. The title carries the revert CLASS, and the five
 classes want DIFFERENT responses — do not apply one to another:
   "Task reverted: X"
       the task was too large or wrong. Plan it SMALLER than last time.
@@ -1635,6 +1714,11 @@ classes want DIFFERENT responses — do not apply one to another:
   "Task reverted (could not be measured): X"
       git could not read the task diff and the evaluator did not judge it. The
       runner was broken, not the task. Do not re-scope; re-plan it as is.
+  "Task reverted (provider error): X"
+      the provider failed in the middle of the task (overload, rate limit,
+      network) and the harness aborted. The task was not judged. Re-plan it as
+      is; the receipt body names a saved patch on the audit-log branch you can
+      start from.
 The receipt BODY holds what a title cannot: the evaluator verdict with its
 per-check reasons, the error details, and the original task spec. If you are about
 to plan anything resembling one of these, read it first — it usually names the exact
@@ -1839,6 +1923,8 @@ TASK SIZING RULES — follow these strictly:
   call. Check Provider/API health above before re-planning; the task itself is not the problem.
   "(could not be measured)" — git could not read the diff and the evaluator did not judge it; the runner
   was broken, not the task. Re-plan it as is.
+  "(provider error)" — the provider failed mid-task and the harness aborted; the task was not judged.
+  Re-plan it as is, starting from the saved patch the receipt body names.
 - Prefer tasks that add/modify one thing and can be verified with cargo build && cargo test.
 
 Also create session_plan/issue_responses.md with your planned response for each issue:
@@ -2254,12 +2340,24 @@ TEOF
         # Abort on API errors (after fallback attempt if configured) — revert partial work and stop
         if agent_log_has_api_error "$TASK_LOG"; then
             echo "    API error in Task $TASK_NUM. Reverting and aborting implementation loop."
+            # #916: record this like any other revert (reason, verdict,
+            # receipt) instead of resetting silently. The class tells the next
+            # planner the provider failed, not the task.
+            REVERT_CLASS=" (provider error)"
+            REVERT_REASON="The provider failed during the implementation agent (API error), so the harness aborted the implementation loop and did not attempt the remaining tasks. This is not a verdict on the task."
+            REVERT_DETAILS=$(grep -E 'error: |API error with no fallback configured' "$TASK_LOG" 2>/dev/null | tail -n 6 | cut -c1-400)
             rm -f "$TASK_LOG"
             save_reverted_task_diff "$PRE_TASK_SHA" "task${TASK_NUM}_api_error"
+            if [ -n "$SAVED_TASK_PATCH" ]; then
+                REVERT_REASON="$REVERT_REASON The task diff is preserved as $(basename "$SAVED_TASK_PATCH") in this session's directory on the audit-log branch (sessions/day-${DAY}-*/), so a retry can start from it."
+            fi
+            GASP_TASK_KIND="$task_kind" gasp_task_result "$TASK_NUM" "$task_title" rejected "$PRE_TASK_SHA" \
+                "$(git rev-parse HEAD 2>/dev/null || echo unknown)" "$REVERT_REASON"
             if ! git reset --hard "$PRE_TASK_SHA"; then
                 echo "    FATAL: git reset --hard failed after API error."
             fi
             git clean -fd 2>/dev/null || true
+            file_revert_receipt
             TASK_FAILURES=$((TASK_FAILURES + 1))
             API_ERROR_ABORT=true
             break
@@ -3145,69 +3243,7 @@ $(cat "session_plan/eval_task_${TASK_NUM}.md" 2>/dev/null || echo 'no eval file 
         TASK_FAILURES=$((TASK_FAILURES + 1))
 
         # File an issue so future sessions know what was reverted
-        if [ "$QUIET_MODE" = false ] && command -v gh &>/dev/null; then
-            # The GitHub App token expires after 60 minutes; a revert deep in
-            # a long session (Day 160: T+94min) fails auth with the startup
-            # token. Refresh before filing — otherwise the receipt vanishes
-            # and the next planner never learns to shrink the task.
-            refresh_gh_token
-            # The class goes in the TITLE, not just the body. The planner's
-            # revert fetch is `--json number,title` (titles only, by design —
-            # see the comment there), and the planner's response is keyed off
-            # that class: plain → plan it smaller; no-progress → find the
-            # blocker first, because the task stalled on something outside the
-            # diff and a smaller version stalls identically. A class buried in a
-            # body the fetch never reads cannot drive that choice.
-            ISSUE_TITLE="Task reverted${REVERT_CLASS:-}: ${task_title:0:180}"
-            ISSUE_BODY="**Day $DAY, Task $TASK_NUM** was automatically reverted by the verification gate.
-${task_issue:+
-**Parent issue:** #$task_issue (first issue named by the task spec) — if every issue this task served is closed, this receipt is history and should be closed too.
-}
-**Reason:** $REVERT_REASON
-
-**Error details:**
-${REVERT_DETAILS:-no details captured}
-
-**What was attempted:**
-$TASK_DESC"
-
-            # Check for existing issue to avoid duplicates. A failed query
-            # must not silently degrade to duplicate filing (review finding
-            # — #667-#670 shows what duplicate receipts cost); warn and
-            # proceed as no-match, which is the least-bad recovery.
-            if ! EXISTING_ISSUE=$(gh issue list --repo "$REPO" --state open \
-                --label "agent-revert" --search "Task reverted: ${task_title}" \
-                --json number --jq '.[0].number' 2>&1); then
-                echo "    WARNING: receipt dedup query failed ($(echo "$EXISTING_ISSUE" | head -1)) — may file a duplicate."
-                EXISTING_ISSUE=""
-            fi
-
-            if [ -n "$EXISTING_ISSUE" ]; then
-                if gh issue comment "$EXISTING_ISSUE" --repo "$REPO" \
-                    --body "Reverted again on Day $DAY. Reason: $REVERT_REASON
-
-**Error details:**
-${REVERT_DETAILS:-no details captured}" 2>/dev/null; then
-                    echo "    Updated existing issue #$EXISTING_ISSUE"
-                else
-                    echo "    WARNING: Could not comment on issue #$EXISTING_ISSUE"
-                fi
-            else
-                # Success prints the URL (the old >/dev/null made a filed
-                # receipt invisible — review finding); failure prints the
-                # real stderr instead of a bare WARNING.
-                CREATE_ERR_F=$(mktemp)
-                if CREATE_URL=$(gh issue create --repo "$REPO" \
-                    --title "$ISSUE_TITLE" \
-                    --body "$ISSUE_BODY" \
-                    --label "agent-revert" 2>"$CREATE_ERR_F"); then
-                    echo "    Filed revert receipt: $CREATE_URL"
-                else
-                    echo "    WARNING: Could not file revert issue: $(head -1 "$CREATE_ERR_F")"
-                fi
-                rm -f "$CREATE_ERR_F"
-            fi
-        fi
+        file_revert_receipt
     else
         if [ "$BUDGET_UNVERIFIED" = "eval_failed" ] || [ "$BUDGET_UNVERIFIED" = "no_progress" ] || [ "$BUDGET_UNVERIFIED" = "eval_infra" ]; then
             # The evaluator RAN and rejected; something other than a PASS ended

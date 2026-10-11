@@ -632,6 +632,48 @@ if require "agent_log_has_api_error extracted" "$AE_FN"; then
     check "api error: context-overflow retry note -> no abort" \
         "$(ae "  (API error: prompt is too long: {\"type\":\"error\"})\n")" "no"
     check "api error: clean log -> no abort" "$(ae "all good\n")" "no"
+    # #916: terminal failures whose own line is not tagged `API error:` are
+    # caught by yoyo's give-up sentinel, which follows every one of them.
+    check "api error: Day-195 rate limit (plain) + give-up sentinel -> abort" \
+        "$(ae "  error: Rate limited, retry after Some(57715000)ms\n  API error with no fallback configured. Exiting.\n")" "yes"
+    check "api error: network error + red give-up sentinel -> abort" \
+        "$(ae "${R}  error: Network error: connection reset${Z}\n${R}  API error with no fallback configured. Exiting.${Z}\n")" "yes"
+    # Near-misses: the source that prints the sentinel, as read_file shows it,
+    # and prose naming the error, must never abort a task.
+    check "api error: the sentinel's source line read by an agent -> no abort" \
+        "$(ae "        eprintln!(\"{RED}  API error with no fallback configured. Exiting.{RESET}\",);\n")" "no"
+    check "api error: numbered read_file line of that source -> no abort" \
+        "$(ae "1958\t        eprintln!(\"{RED}  API error with no fallback configured. Exiting.{RESET}\",);\n")" "no"
+    check "api error: prose mentioning rate limits -> no abort" \
+        "$(ae "The provider said Rate limited earlier, so I waited.\n")" "no"
+fi
+
+# ── #916: the API-error abort files a classed receipt like any revert ────────
+# Ends at the next section, not the first column-0 `}`: the receipt body has
+# one inside a quoted string (the close of `${task_issue:+ … }`).
+RR_FN=$(awk '/^file_revert_receipt\(\) \{/{p=1} /^# ── Keep a reverted task/{exit} p' "$SCRIPT")
+if require "file_revert_receipt extracted" "$RR_FN"; then
+    rr_case() { # fake gh on PATH records the create call → title|label
+        ( set +e; d=$(mktemp -d)
+          printf '#!/bin/sh\ncase "$1 $2" in\n  "issue list") exit 0;;\n  "issue create") shift 2; while [ $# -gt 0 ]; do case "$1" in --title) echo "T:$2";; --label) echo "L:$2";; esac; shift; done >> "%s/calls"; echo https://example/1;;\nesac\n' "$d" > "$d/gh"
+          chmod +x "$d/gh"; PATH="$d:$PATH"
+          refresh_gh_token() { :; }
+          QUIET_MODE=false; REPO=o/r; DAY=226; TASK_NUM=1; task_title="Fix the thing"; task_issue=""
+          TASK_DESC="spec"; REVERT_CLASS=" (provider error)"; REVERT_REASON="r"; REVERT_DETAILS="d"
+          eval "$RR_FN"; file_revert_receipt >/dev/null
+          printf '%s|%s' "$(grep '^T:' "$d/calls" | cut -c3-)" "$(grep '^L:' "$d/calls" | cut -c3-)"
+          rm -rf "$d" ) 2>/dev/null
+    }
+    check "receipt: provider-error class lands in the title with the agent-revert label" \
+        "$(rr_case)" "Task reverted (provider error): Fix the thing|agent-revert"
+    # Wiring: the abort records a verdict and files the receipt before it breaks.
+    AB=$(awk '/if agent_log_has_api_error "\$TASK_LOG"; then/{p=1} p{print} p&&/^            break$/{exit}' "$SCRIPT")
+    check "api abort: sets the provider-error class" "$(echo "$AB" | grep -c 'REVERT_CLASS=" (provider error)"')" "1"
+    check "api abort: records a rejected GASP verdict" "$(echo "$AB" | grep -c 'gasp_task_result .* rejected')" "1"
+    check "api abort: files the receipt" "$(echo "$AB" | grep -c '^            file_revert_receipt$')" "1"
+    check "planner prompt: the class list says five" "$(grep -cF 'CLASS, and the five' "$SCRIPT")" "1"
+    check "planner prompt: RECENTLY REVERTED lists provider error" "$(grep -cF '"Task reverted (provider error): X"' "$SCRIPT")" "1"
+    check "planner prompt: task guidance lists provider error" "$(grep -cF '"(provider error)" — the provider failed' "$SCRIPT")" "1"
 fi
 
 # ── model: .yoyo.toml is the single source, nothing hardcodes an id ─────────
@@ -782,8 +824,8 @@ if require "save_reverted_task_diff extracted" "$SAVE_FN"; then
     check "revert save: a task with no changes saves nothing" "$(save_case none)" "|clean|none|"
     # Both reset sites save first: the call sits right above each reset.
     check "revert save: the API-error abort saves before its reset" \
-        "$(grep -A1 -F 'save_reverted_task_diff "$PRE_TASK_SHA" "task${TASK_NUM}_api_error"' "$SCRIPT" | tail -1 | tr -d ' ')" \
-        'if!gitreset--hard"$PRE_TASK_SHA";then'
+        "$(awk '/if agent_log_has_api_error "\$TASK_LOG"; then/{p=1} p&&/save_reverted_task_diff/{s=NR} p&&/git reset --hard "\$PRE_TASK_SHA"/{print (s && s<NR) ? "save-first" : "reset-first"; exit}' "$SCRIPT")" \
+        "save-first"
     check "revert save: the verification revert saves before its reset" \
         "$(grep -c -F 'save_reverted_task_diff "$PRE_TASK_SHA" "task${TASK_NUM}_reverted"' "$SCRIPT")" "1"
 fi
