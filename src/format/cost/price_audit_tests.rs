@@ -162,11 +162,51 @@ fn cells_within(ours: Rates, theirs: Rates, rel_tol: f64) -> bool {
 /// Stated as "the other three agree" rather than "cache_read differs" on purpose:
 /// a row that also moved its input or output rate is a repricing and must not be
 /// absorbed here.
+///
+/// **And `ours.2 == 0.0` is a conjunct, not an assumption (#1004).** The bucket
+/// exists for the cell the table *leaves at zero*; a NONZERO cache_read the
+/// table did model, and models.dev says is wrong, is a repricing. Without this
+/// conjunct `claude-sonnet-5-5` (ours 0.2, models.dev 0.1) was filed here and
+/// never reached the `drifted` assertion — the doc said "the one cell this table
+/// intentionally leaves at 0.0" and the code never checked the 0.0.
 fn only_cache_read_differs(ours: Rates, theirs: Rates, rel_tol: f64) -> bool {
-    within_rel_tolerance(ours.0, theirs.0, rel_tol)
+    ours.2 == 0.0
+        && within_rel_tolerance(ours.0, theirs.0, rel_tol)
         && within_rel_tolerance(ours.1, theirs.1, rel_tol)
         && within_rel_tolerance(ours.3, theirs.3, rel_tol)
         && !within_rel_tolerance(ours.2, theirs.2, rel_tol)
+}
+
+/// The one per-row verdict. Both the summary buckets in [`compare_catalogue`]
+/// and the per-row `state` column of the live audit print from this, so two
+/// lines of one report cannot disagree about the same row (before #1004 the
+/// column said `DRIFT` for a row the summary filed under `cache_read_only`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    Match,
+    CacheReadOnly,
+    Drift,
+}
+
+impl RowState {
+    /// The word the per-row column prints, named after the summary's buckets.
+    fn label(self) -> &'static str {
+        match self {
+            RowState::Match => "match",
+            RowState::CacheReadOnly => "cache_read_only",
+            RowState::Drift => "DRIFT",
+        }
+    }
+}
+
+fn classify_row(ours: Rates, theirs: Rates, rel_tol: f64) -> RowState {
+    if cells_within(ours, theirs, rel_tol) {
+        RowState::Match
+    } else if only_cache_read_differs(ours, theirs, rel_tol) {
+        RowState::CacheReadOnly
+    } else {
+        RowState::Drift
+    }
 }
 
 /// The whole comparison, with the network removed — feed it two lists and it says
@@ -190,14 +230,12 @@ fn compare_catalogue(
             None => report.unpriced.push(key),
             Some((_, our_price)) => {
                 report.compared += 1;
-                if cells_within(*our_price, row.price, rel_tol) {
-                    report.matched += 1;
-                } else if only_cache_read_differs(*our_price, row.price, rel_tol) {
-                    // Every other rate agrees, so this is the known
-                    // cache-read coverage gap, not a repricing.
-                    report.cache_read_only.push(key);
-                } else {
-                    report.drifted.push((key, *our_price, row.price));
+                match classify_row(*our_price, row.price, rel_tol) {
+                    RowState::Match => report.matched += 1,
+                    // Every other rate agrees and the table left cache_read at
+                    // 0.0, so this is the known coverage gap, not a repricing.
+                    RowState::CacheReadOnly => report.cache_read_only.push(key),
+                    RowState::Drift => report.drifted.push((key, *our_price, row.price)),
                 }
             }
         }
@@ -511,11 +549,8 @@ fn audit_table_against_models_dev() {
         let Some(our) = price_of(yoyo_id) else {
             continue;
         };
-        let state = if cells_within(our, row.price, REL_TOL) {
-            "match"
-        } else {
-            "DRIFT"
-        };
+        // Same classifier as the summary below, so the column and the counts agree.
+        let state = classify_row(our, row.price, REL_TOL).label();
         println!(
             "{:<44} {:<28} {:<28} {}",
             row.key(),
@@ -1354,4 +1389,47 @@ fn the_cost_resolver_returns_the_preset_price_for_opus_5_5() {
             "{id}: resolver disagrees with the preset's price"
         );
     }
+}
+
+/// **#1004 — `cache_read_only` means "the cell this table leaves at 0.0", so a
+/// NONZERO cache_read that disagrees is a repricing, not the coverage gap.** One
+/// classifier, three rows: (a) ours 0.0 vs theirs 0.1 is the intended
+/// coverage-gap bucket; (b) ours 0.2 vs theirs 0.1 — the `claude-sonnet-5-5` row
+/// from #1004's measured output — is DRIFT, because the table did model that
+/// cell and models.dev says it is wrong; (c) all-equal agrees. Before #1004, (b)
+/// landed in `cache_read_only` and never reached the `drifted` assertion, so the
+/// alarm was silent on the one real drift it had found.
+#[test]
+fn a_wrong_nonzero_cache_read_is_drift_not_the_coverage_gap() {
+    let other = |cr: f64| (3.0, 3.75, cr, 15.0);
+    let table = [
+        (
+            "a: ours 0.0, theirs 0.1",
+            other(0.0),
+            other(0.1),
+            RowState::CacheReadOnly,
+        ),
+        (
+            "b: ours 0.2, theirs 0.1 (#1004)",
+            other(0.2),
+            other(0.1),
+            RowState::Drift,
+        ),
+        ("c: all equal", other(0.3), other(0.3), RowState::Match),
+    ];
+    for (name, ours, theirs, want) in table {
+        assert_eq!(classify_row(ours, theirs, REL_TOL), want, "row {name}");
+    }
+
+    // And through the whole comparator, so the summary bucket agrees with the
+    // per-row classifier rather than a second copy of it.
+    let cat = vec![row("anthropic", "claude-sonnet-5-5", other(0.1))];
+    let ours = vec![(cat[0].key(), other(0.2))];
+    let report = compare_catalogue(&ours, &cat, REL_TOL);
+    assert!(
+        report.cache_read_only.is_empty(),
+        "a modelled-but-wrong cache_read must not be absorbed as the coverage gap"
+    );
+    assert_eq!(report.drifted.len(), 1, "it is drift, named");
+    assert_eq!(report.drifted[0].0, "anthropic/claude-sonnet-5-5");
 }
