@@ -116,7 +116,10 @@ impl AgentTool for GuardedTool {
         let params = repair_path_argument(params);
         // Check the "path" parameter against directory restrictions
         if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
-            if let Err(reason) = self.restrictions.check_path(path) {
+            // Startup fence, then `/cd`-added `[directories] deny` (#869, Day 226).
+            if let Some(reason) =
+                crate::cd_config_note::path_guard_refusal(&self.restrictions, path)
+            {
                 return Err(yoagent::types::ToolError::Failed(reason));
             }
         }
@@ -191,7 +194,10 @@ impl AgentTool for ArcGuardedTool {
         let params = repair_path_argument(params);
         // Check the "path" parameter against directory restrictions
         if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
-            if let Err(reason) = self.restrictions.check_path(path) {
+            // Startup fence, then `/cd`-added `[directories] deny` (#869, Day 226).
+            if let Some(reason) =
+                crate::cd_config_note::path_guard_refusal(&self.restrictions, path)
+            {
                 return Err(yoagent::types::ToolError::Failed(reason));
             }
         }

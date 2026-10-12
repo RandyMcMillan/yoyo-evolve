@@ -534,4 +534,9 @@ is tracked in issue #749.
 
 ## After `/cd`
 
-`/cd` applies one part of the new directory's `.yoyo.toml`: its `[permissions] deny` patterns. They are added to the session's deny list and enforced on bash commands (the agent's and sub-agents') for the rest of the session. The list only grows: `/cd`-ing back does not remove anything. Deny patterns apply to bash only; file tools never read them. Everything else in the new directory's config (`allow`, `[directories]`, hooks, MCP servers, skills) is still **not** reloaded, and yoyo prints a warning naming what was skipped. Restart yoyo in that directory to use it (#869).
+`/cd` applies two parts of the new directory's `.yoyo.toml`, both of which only narrow what yoyo may do:
+
+- its `[permissions] deny` patterns are added to the session's deny list and enforced on bash commands (the agent's and sub-agents'). File tools never read them.
+- its `[directories] deny` entries are refused by the file tools (the agent's and sub-agents'). A relative entry such as `secrets` is resolved against the directory you `/cd`'d into, at that moment, so it keeps meaning `<that dir>/secrets` after a later `/cd`. They apply even when `--allow-dir`/`--deny-dir` was given at startup, and bash never reads them.
+
+Both lists last for the rest of the session and only grow: `/cd`-ing back does not remove anything. Everything else in the new directory's config (`[permissions] allow`, `[directories] allow`, hooks, MCP servers, skills) is still **not** reloaded, and yoyo prints a warning naming what was skipped. Restart yoyo in that directory to use it (#869). Readers outside the model's file tools, such as `@path` mentions, `/add` and the project-context loaders, still use only the startup `[directories]` fence.
