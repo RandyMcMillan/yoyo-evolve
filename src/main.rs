@@ -166,6 +166,7 @@ mod rtk;
 mod safety;
 mod session;
 mod setup;
+mod skill_fence;
 mod smart_edit;
 mod stream_leading_blank;
 mod symbols;

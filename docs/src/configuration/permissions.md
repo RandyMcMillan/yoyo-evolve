@@ -216,6 +216,11 @@ warning. Project memories (`.yoyo/memory.json`) get the same treatment: if the m
 refused, no memories are added to the system prompt and yoyo prints a warning. (The REPL `/memories` and
 `/remember` commands are not fenced yet. They show on your terminal or write to disk, and nothing they do is sent
 to the model.)
+Skill directories (`--skills <dir>`, `.yoyo/skills/`, `~/.yoyo/skills/` and the install dir) are fenced too: if
+any skill's `SKILL.md` resolves to a refused location, that whole directory is not loaded (none of its skills are
+offered to the model) and yoyo prints a warning naming the refused files. With `--allow-dir`, this includes your
+user-level `~/.yoyo/skills/` when it lies outside every allowed directory, because `read_file` could not open those
+skills anyway.
 Files you name yourself (`@path` mentions, `/add`, `/explain`, `--image`) are fenced the same way: a file whose
 resolved target is refused is not sent to the model, yoyo prints a warning naming it, and the rest of the prompt
 still goes through.

@@ -505,7 +505,7 @@ customizations."
 ///   4. The install dir (`~/.config/yoyo/skills/`) is lowest precedence.
 ///
 /// Returns the total number of skills auto-discovered (before dedup with flag skills).
-fn auto_discover_skills(skills: &mut SkillSet) -> usize {
+fn auto_discover_skills(skills: &mut SkillSet, fence: &DirectoryRestrictions) -> usize {
     let mut auto_skills = SkillSet::empty();
     let mut count = 0usize;
     // Directories that actually yielded at least one skill. A directory that
@@ -547,6 +547,10 @@ fn auto_discover_skills(skills: &mut SkillSet) -> usize {
 
     for source in gated.sources {
         if !source.dir.is_dir() {
+            continue;
+        }
+        // #1002: the directory fence, judged at each SKILL.md's resolved target.
+        if !crate::skill_fence::admit_skill_dir(&source.dir, &source.warn_target, fence) {
             continue;
         }
         // Resilient: one malformed SKILL.md is skipped with a warning naming
@@ -2619,6 +2623,12 @@ directory ({e}); this run is trusted, later runs will not be."
         crate::commands_config::set_editor_model(Some(editor));
     }
 
+    // Directory fence first (#1002, skills door): skill dirs are put to it
+    // before yoagent reads them, so it must exist before skill loading. Its
+    // project-context use below is unchanged.
+    let (permissions, mut dir_restrictions) =
+        parse_permission_and_dir_config(args, &raw_config_content);
+
     let skill_dirs = collect_repeatable_flag(args, "--skills");
     // Record the flag dirs so skill-aware reporting (e.g. /doctor's context-cost
     // audit) can see this source too, not just the auto-discovery dirs.
@@ -2629,7 +2639,13 @@ directory ({e}); this run is trusted, later runs will not be."
     } else {
         // Resilient: a malformed SKILL.md in one of the --skills dirs is skipped
         // with a warning; every other skill across every listed dir still loads (#677).
-        let (set, errors) = SkillSet::load_resilient(&skill_dirs);
+        let admitted: Vec<&String> = skill_dirs
+            .iter()
+            .filter(|d| {
+                crate::skill_fence::admit_skill_dir(std::path::Path::new(d), d, &dir_restrictions)
+            })
+            .collect();
+        let (set, errors) = SkillSet::load_resilient(&admitted);
         for e in &errors {
             eprintln!("{YELLOW}warning:{RESET} skipping malformed skill: {e}");
         }
@@ -2640,7 +2656,7 @@ directory ({e}); this run is trusted, later runs will not be."
     // and .yoyo/skills/ (project-local).
     // Later loads override earlier ones on name conflict, so project-local wins over global,
     // and --skills flag wins over both (since flag skills are already in `skills`).
-    let _auto_skill_count = auto_discover_skills(&mut skills);
+    let _auto_skill_count = auto_discover_skills(&mut skills, &dir_restrictions);
 
     // Custom system prompt: --system "text" or --system-file path
     let custom_system = flag_value(args, &["--system"]);
@@ -2686,8 +2702,8 @@ directory ({e}); this run is trusted, later runs will not be."
     // project context load so instruction files honour the --deny-dir /
     // --allow-dir fence at their resolved target (#1002); it reads only `args`
     // and the raw config, so hoisting it changes nothing else.
-    let (permissions, mut dir_restrictions) =
-        parse_permission_and_dir_config(args, &raw_config_content);
+    // (`permissions` / `dir_restrictions` were parsed above, before skill
+    // loading, so skill dirs are fenced too.)
     if !safe_mode {
         if let Some(project_context) = load_project_context(&dir_restrictions) {
             system_prompt.push_str("\n\n# Project Instructions\n\n");
@@ -6403,7 +6419,7 @@ command = "server-two"
         let mut skills = SkillSet::empty();
         // Calling the function directly — it checks .yoyo/skills/ in cwd which
         // may or may not exist, but must not panic either way
-        let count = auto_discover_skills(&mut skills);
+        let count = auto_discover_skills(&mut skills, &DirectoryRestrictions::default());
         // We can't assert exact count since it depends on cwd, but it shouldn't panic
         let _ = count; // just verify it ran without panicking
     }
