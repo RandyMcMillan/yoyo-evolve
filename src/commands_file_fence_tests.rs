@@ -274,3 +274,152 @@ fn no_restrictions_inline_exactly_as_before() {
     );
     assert_eq!(added, vec![link]);
 }
+
+// ---------------------------------------------------------------------
+// #869: the `/cd`-appended `[directories] deny` list reaches these doors.
+// Driven through a per-thread override, never the process-wide list.
+// ---------------------------------------------------------------------
+
+use crate::cd_deny::DenyAdditions;
+use crate::commands_file_fence::{admit_for_add_with, CD_DENY_SOURCE_NOTE, TEST_CD_DIR_DENY};
+
+fn cd_list(entries: &[&Path]) -> DenyAdditions {
+    std::sync::Arc::new(std::sync::Mutex::new(
+        entries.iter().map(|p| s(p)).collect(),
+    ))
+}
+
+/// Run `f` with the doors reading `list` as the `/cd` list on this thread.
+fn with_cd_list<T>(list: DenyAdditions, f: impl FnOnce() -> T) -> T {
+    TEST_CD_DIR_DENY.with(|c| *c.borrow_mut() = Some(list));
+    let out = f();
+    TEST_CD_DIR_DENY.with(|c| *c.borrow_mut() = None);
+    out
+}
+
+/// The exact line for a `/cd`-list refusal, spelled out from literals.
+fn expected_cd_deny_line(path: &str, denied: &str) -> String {
+    let reason = format!(
+        "Access denied: '{path}' is under restricted directory '{denied}' (a [directories] deny entry applied by /cd)"
+    );
+    if crate::format::is_plain_output() {
+        format!("warning: {path} not sent to the model - {reason}")
+    } else {
+        format!("⚠ {path} not sent to the model — {reason}")
+    }
+}
+
+#[test]
+fn cd_deny_note_names_the_cd_source() {
+    assert_eq!(
+        CD_DENY_SOURCE_NOTE,
+        "(a [directories] deny entry applied by /cd)"
+    );
+}
+
+#[test]
+fn cd_denied_dir_is_refused_with_exact_line_direct_and_via_symlink() {
+    let f = fixture();
+    let direct = s(&f.secret.join("notes.md"));
+    let link = s(&f.proj.join("notes.md"));
+    let list = cd_list(&[&f.secret]);
+    for p in [&direct, &link] {
+        // The startup fence is empty: only the `/cd` list can refuse.
+        assert_eq!(
+            admit_for_add_with(&list, p, &none()),
+            Err(AddReadError::Refused(expected_cd_deny_line(
+                p,
+                &s(&f.secret)
+            )))
+        );
+        let err = with_cd_list(list.clone(), || read_file_for_add(p, None, &none())).unwrap_err();
+        assert_eq!(
+            err,
+            AddReadError::Refused(expected_cd_deny_line(p, &s(&f.secret)))
+        );
+        assert!(!err.to_string().contains(TOKEN));
+    }
+}
+
+#[test]
+fn cd_denied_mention_is_not_inlined() {
+    let f = fixture();
+    let link = s(&f.proj.join("notes.md"));
+    let input = format!("look @{link} please");
+    // Anti-vacuous: with an empty `/cd` list this mention DOES inline the token.
+    let (_, open) = with_cd_list(cd_list(&[]), || expand_file_mentions(&input, &none()));
+    assert!(texts(&open).concat().contains(TOKEN), "fixture must leak");
+
+    let (text, results) = with_cd_list(cd_list(&[&f.secret]), || {
+        expand_file_mentions(&input, &none())
+    });
+    assert!(results.is_empty(), "{:?}", texts(&results));
+    assert_eq!(text, input);
+    assert!(!text.contains(TOKEN));
+}
+
+#[test]
+fn cd_denied_add_explain_and_image_are_refused() {
+    let f = fixture();
+    let link = s(&f.proj.join("notes.md"));
+    let pic = s(&f.proj.join("pic.png"));
+    let list = cd_list(&[&f.secret]);
+    let (res, added) = with_cd_list(list.clone(), || {
+        handle_add(&format!("/add {link}"), &none())
+    });
+    assert!(res.is_empty(), "{:?}", texts(&res));
+    assert!(added.is_empty());
+    assert_eq!(
+        with_cd_list(list.clone(), || build_explain_prompt(
+            &format!("/explain {link}"),
+            &none()
+        )),
+        None
+    );
+    assert_eq!(
+        with_cd_list(list, || read_image_for_add(&pic, &none())).unwrap_err(),
+        AddReadError::Refused(expected_cd_deny_line(&pic, &s(&f.secret)))
+    );
+}
+
+#[test]
+fn startup_fence_wins_and_keeps_its_wording_when_both_deny() {
+    let f = fixture();
+    let link = s(&f.proj.join("notes.md"));
+    assert_eq!(
+        admit_for_add_with(&cd_list(&[&f.secret]), &link, &deny(&f.secret)),
+        Err(AddReadError::Refused(expected_deny_line(
+            &link,
+            &s(&f.secret)
+        )))
+    );
+}
+
+#[test]
+fn empty_cd_list_is_byte_identical_and_cd_list_elsewhere_is_inert() {
+    let f = fixture();
+    let link = s(&f.proj.join("notes.md"));
+    let plain = s(&f.proj.join("plain.md"));
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    for r in [none(), deny(&f.secret), allow(&f.proj)] {
+        for p in [&link, &plain] {
+            let input = format!("look @{p}");
+            let base_mention = expand_file_mentions(&input, &r);
+            let base_add = handle_add(&format!("/add {p}"), &r);
+            let base_read = read_file_for_add(p, None, &r);
+            for list in [cd_list(&[]), cd_list(&[elsewhere.path()])] {
+                let (text, res) = with_cd_list(list.clone(), || expand_file_mentions(&input, &r));
+                assert_eq!(text, base_mention.0);
+                assert_eq!(texts(&res), texts(&base_mention.1));
+                let (ares, aadded) =
+                    with_cd_list(list.clone(), || handle_add(&format!("/add {p}"), &r));
+                assert_eq!(texts(&ares), texts(&base_add.0));
+                assert_eq!(aadded, base_add.1);
+                assert_eq!(
+                    with_cd_list(list.clone(), || read_file_for_add(p, None, &r)),
+                    base_read
+                );
+            }
+        }
+    }
+}

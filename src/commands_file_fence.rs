@@ -43,18 +43,65 @@ pub(crate) fn add_fence_refusal_message(path: &str, reason: &str, plain: bool) -
 /// read through `commands_file::read_file_for_add` / `read_image_for_add`, which call
 /// this before touching the bytes. It asks `DirectoryRestrictions::check_path`
 /// — the resolver the file tools and prompt loaders use — so a symlink is
-/// judged at its target. With no restrictions it short-circuits to `Ok`.
+/// judged at its target. It also asks the `[directories] deny` entries `/cd`
+/// has appended (#869), so these doors refuse what `read_file` refuses after a
+/// `/cd`. With no restrictions and an empty `/cd` list it short-circuits to `Ok`.
 pub(crate) fn admit_for_add(
     path: &str,
     restrictions: &crate::config::DirectoryRestrictions,
 ) -> Result<(), AddReadError> {
-    restrictions.check_path(path).map_err(|reason| {
-        AddReadError::Refused(add_fence_refusal_message(
+    admit_for_add_with(&cd_dir_deny_list(), path, restrictions)
+}
+
+/// [`admit_for_add`] with the `/cd`-appended `[directories] deny` list passed
+/// in (#869). The startup fence is asked first and its verdict and wording are
+/// byte-identical to before; only a path it admits is then asked of the `/cd`
+/// list, through `cd_config_note::cd_denied_dir_refusal_with` — the same
+/// predicate (and so the same `check_path` matching: symlinks, wildcards,
+/// unresolvable paths) the file tools' `path_guard_refusal` uses. It is
+/// called directly rather than through `path_guard_refusal_with` only so the
+/// refusal can say which list refused. An empty `/cd` list adds no check.
+pub(crate) fn admit_for_add_with(
+    cd_list: &crate::cd_deny::DenyAdditions,
+    path: &str,
+    restrictions: &crate::config::DirectoryRestrictions,
+) -> Result<(), AddReadError> {
+    let plain = crate::format::is_plain_output();
+    if let Err(reason) = restrictions.check_path(path) {
+        return Err(AddReadError::Refused(add_fence_refusal_message(
+            path, &reason, plain,
+        )));
+    }
+    if let Some(reason) = crate::cd_config_note::cd_denied_dir_refusal_with(cd_list, path) {
+        return Err(AddReadError::Refused(add_fence_refusal_message(
             path,
-            &reason,
-            crate::format::is_plain_output(),
-        ))
-    })
+            &format!("{reason} {CD_DENY_SOURCE_NOTE}"),
+            plain,
+        )));
+    }
+    Ok(())
+}
+
+/// Appended to a refusal that came from the `/cd`-applied list, so the user
+/// can tell it apart from a launch `--deny-dir` / startup-config refusal.
+pub(crate) const CD_DENY_SOURCE_NOTE: &str = "(a [directories] deny entry applied by /cd)";
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only, per-thread override of the `/cd` list the doors read, so a
+    /// door-level test (`expand_file_mentions`, `handle_add`, ...) can drive a
+    /// local list without writing the process-wide one. `None` = production.
+    pub(crate) static TEST_CD_DIR_DENY: std::cell::RefCell<Option<crate::cd_deny::DenyAdditions>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The `/cd` list the doors consult: the process-wide handle in production.
+fn cd_dir_deny_list() -> crate::cd_deny::DenyAdditions {
+    #[cfg(test)]
+    if let Some(list) = TEST_CD_DIR_DENY.with(|c| c.borrow().clone()) {
+        return list;
+    }
+    crate::cd_config_note::cd_denied_dirs_handle()
 }
 
 /// The coloured line a door prints when a user-named file was not read: a

@@ -290,6 +290,14 @@ pub(crate) fn path_guard_refusal_with(
         .or_else(|| cd_denied_dir_refusal_with(list, path))
 }
 
+/// A clone of the process-wide `/cd` directory-deny handle, for readers outside
+/// this module that compose their own refusal wording (`commands_file_fence`'s
+/// `@path`/`/add`/`/explain`/`--image` doors, #869). Mirrors
+/// `cd_deny::cd_added_deny_handle`.
+pub(crate) fn cd_denied_dirs_handle() -> crate::cd_deny::DenyAdditions {
+    std::sync::Arc::clone(&CD_DENIED_DIRS)
+}
+
 /// The production guard call, reading the process-wide `/cd` list.
 pub(crate) fn path_guard_refusal(
     startup: &crate::config::DirectoryRestrictions,
