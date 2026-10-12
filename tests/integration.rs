@@ -3414,3 +3414,49 @@ fn bare_grep_exits_two_with_usage_unchanged_and_no_match_exits_zero() {
         "  No matches found.\n"
     );
 }
+
+#[test]
+fn find_refuses_extra_args_and_passes_one_spaced_arg_verbatim() {
+    // #982/#1009: `yoyo find main src` folded `src` into the pattern and
+    // printed a false "No files matching 'main src'." with exit 0;
+    // `yoyo find "a b"` searched for the literal `"a b"` (quotes included).
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("dir sp")).unwrap();
+    std::fs::write(dir.path().join("dir sp").join("a b.rs"), "").unwrap();
+    std::fs::write(dir.path().join("main.rs"), "").unwrap();
+
+    let extra = yoyo_in_dir(dir.path(), &["find", "main", "src"]);
+    let stdout = String::from_utf8_lossy(&extra.stdout);
+    let stderr = String::from_utf8_lossy(&extra.stderr);
+    assert_eq!(
+        extra.status.code(),
+        Some(2),
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(!stdout.contains("No files matching"), "{stdout:?}");
+    assert!(
+        stderr.contains("find takes ONE pattern and has no path argument")
+            && stderr.contains("'main' 'src'"),
+        "{stderr:?}"
+    );
+
+    let spaced = yoyo_in_dir(dir.path(), &["find", "a b"]);
+    let stdout = String::from_utf8_lossy(&spaced.stdout);
+    assert_eq!(spaced.status.code(), Some(0), "{stdout:?}");
+    assert!(stdout.contains("dir sp/a b.rs"), "{stdout:?}");
+
+    let bare = yoyo_in_dir(dir.path(), &["find"]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bare.stdout).contains("usage: /find <pattern>"));
+
+    // Near miss: one plain pattern is unchanged, and no match stays exit 0.
+    let one = yoyo_in_dir(dir.path(), &["find", "main"]);
+    assert_eq!(one.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&one.stdout).contains("main.rs"));
+    let none = yoyo_in_dir(dir.path(), &["find", "zzqq_nomatch1009"]);
+    assert_eq!(none.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&none.stdout),
+        "  No files matching 'zzqq_nomatch1009'.\n\n"
+    );
+}

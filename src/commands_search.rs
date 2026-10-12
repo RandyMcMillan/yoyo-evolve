@@ -358,7 +358,9 @@ pub(crate) fn handle_find_status(input: &str) -> i32 {
         println!("{DIM}  usage: /find <pattern>");
         println!("  Fuzzy-search project files by name.");
         println!("  Examples: /find main, /find .toml, /find test{RESET}\n");
-        return 0;
+        // #982: a usage error, as bare `grep`/`def`/`outline`; the REPL
+        // (`handle_find`) discards the status.
+        return SEARCH_USAGE_EXIT;
     }
     let (matches, unreadable) = find_files_in(".", arg);
     print!("{}", render_find_matches(arg, &matches));

@@ -83,6 +83,35 @@ fn quote_args_as_command(args: &[String]) -> String {
     format!("/{}", parts.join(" "))
 }
 
+/// The `/find` pattern for `yoyo find <argv…>` (#982, #1009), from the
+/// elements after `find`. `/find` takes ONE pattern and has no path argument,
+/// so one element is returned verbatim (no `quote_args_as_command` wrapping:
+/// that sent `"a b"` with its quotes to the matcher), zero is the empty pattern
+/// the handler answers with usage (exit 2), and two or more is refused rather
+/// than folded into one pattern (`find main src` used to search `main src`
+/// and report a false "No files matching" with exit 0). Shell door only:
+/// a REPL `/find a b` is one string and a spaced pattern is legal there.
+pub(crate) fn find_pattern_from_argv(rest: &[String]) -> Result<String, String> {
+    match rest {
+        [] => Ok(String::new()),
+        [one] => Ok(one.clone()),
+        many => {
+            let shown: Vec<String> = many
+                .iter()
+                .map(|a| format!("'{}'", crate::cli::sanitize_for_display(a)))
+                .collect();
+            let joined = crate::cli::sanitize_for_display(&many.join(" "));
+            Err(format!(
+                "  find takes ONE pattern and has no path argument; got {} arguments: {}.\n  \
+                 To search for a name that contains a space, pass it as one quoted argument: yoyo find \"{}\"",
+                many.len(),
+                shown.join(" "),
+                joined
+            ))
+        }
+    }
+}
+
 /// Exit status for `yoyo risk <sub>` (#982): 2 (usage) for a verb
 /// `handle_risk` refuses, using its own sub extraction and classifier.
 pub(crate) fn risk_status(input: &str) -> i32 {
@@ -398,8 +427,17 @@ pub(crate) fn try_dispatch_subcommand_in(
                 return Some(None);
             }
             "find" => {
-                let input = quote_args_as_command(args);
-                // #982: 1 when a directory could not be read (find(1)'s code).
+                // #1009: argv verbatim, not `quote_args_as_command`. #982: 2 for
+                // extra args or no pattern, 1 when a directory could not be read
+                // (find(1)'s code); no match stays 0.
+                let pattern = match find_pattern_from_argv(&args[2..]) {
+                    Ok(p) => p,
+                    Err(refusal) => {
+                        eprintln!("{refusal}");
+                        std::process::exit(crate::commands_search::SEARCH_USAGE_EXIT);
+                    }
+                };
+                let input = format!("/find {pattern}");
                 exit_if_nonzero(crate::commands_search::handle_find_status(&input));
                 return Some(None);
             }
@@ -1649,6 +1687,58 @@ mod tests {
             matches!(result, Some(None)),
             "expected Some(None) for `find` subcommand"
         );
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn find_pattern_from_argv_table() {
+        // #982/#1009: one argv element reaches `/find` verbatim; zero is the
+        // handler's usage path (empty pattern); two or more is refused.
+        let ok_rows: [(&[&str], &str); 4] = [
+            (&[], ""),
+            (&["main"], "main"),
+            (&["a b"], "a b"),
+            (&["say \"hi\""], "say \"hi\""),
+        ];
+        for (input, want) in ok_rows {
+            assert_eq!(
+                find_pattern_from_argv(&argv(input)),
+                Ok(want.to_string()),
+                "input {input:?}"
+            );
+        }
+        assert_eq!(
+            find_pattern_from_argv(&argv(&["main", "src"])),
+            Err("  find takes ONE pattern and has no path argument; got 2 arguments: 'main' 'src'.\n  \
+                 To search for a name that contains a space, pass it as one quoted argument: yoyo find \"main src\""
+                .to_string())
+        );
+        assert_eq!(
+            find_pattern_from_argv(&argv(&["a", "b", "c"])),
+            Err("  find takes ONE pattern and has no path argument; got 3 arguments: 'a' 'b' 'c'.\n  \
+                 To search for a name that contains a space, pass it as one quoted argument: yoyo find \"a b c\""
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn find_pattern_from_argv_plain_arg_is_byte_identical() {
+        // Near miss: the common case must not change at all.
+        assert_eq!(
+            find_pattern_from_argv(&argv(&["main"])).as_deref(),
+            Ok("main")
+        );
+    }
+
+    #[test]
+    fn find_pattern_refusal_escapes_control_bytes() {
+        let hostile = "x\u{1b}[31m";
+        assert!(hostile.as_bytes().contains(&0x1b), "fixture carries ESC");
+        let err = find_pattern_from_argv(&argv(&[hostile, "y"])).unwrap_err();
+        assert!(!err.as_bytes().contains(&0x1b), "{err:?}");
     }
 
     #[test]
