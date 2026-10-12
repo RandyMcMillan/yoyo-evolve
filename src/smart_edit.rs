@@ -363,6 +363,50 @@ fn extract_matched_text(
     file_lines[match_line_0indexed..end].join("\n")
 }
 
+/// Appended to a not-found error when the target file uses CRLF line endings,
+/// so the model does not misdiagnose the miss (it never sees `\r`).
+const CRLF_NOT_FOUND_NOTE: &str = "\n\nNote: this file uses CRLF (\\r\\n) line endings. A multi-line \
+     old_text written with \\n is already retried with \\r\\n, so the mismatch is in the text itself.";
+
+/// Spell every bare `\n` as `\r\n`; an existing `\r\n` is never doubled.
+fn bare_lf_to_crlf(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// The CRLF rule: when `file` does not contain `old` literally, but does contain
+/// it with each bare `\n` spelled `\r\n`, return `(old, new)` spelled that way.
+/// The literal match always wins (`None`), as does an `old` with no bare `\n`.
+fn crlf_adapted_edit(file: &str, old: &str, new: &str) -> Option<(String, String)> {
+    if file.contains(old) {
+        return None;
+    }
+    let old_crlf = bare_lf_to_crlf(old);
+    if old_crlf == old || !file.contains(old_crlf.as_str()) {
+        return None;
+    }
+    Some((old_crlf, bare_lf_to_crlf(new)))
+}
+
+/// `params` with old_text/new_text rewritten by [`crlf_adapted_edit`], or `None`.
+fn crlf_adapted_params(params: &serde_json::Value, file: &str) -> Option<serde_json::Value> {
+    let old = params.get("old_text")?.as_str()?;
+    let new = params.get("new_text")?.as_str()?;
+    let (old_crlf, new_crlf) = crlf_adapted_edit(file, old, new)?;
+    let mut adapted = params.clone();
+    adapted["old_text"] = serde_json::Value::String(old_crlf);
+    adapted["new_text"] = serde_json::Value::String(new_crlf);
+    Some(adapted)
+}
+
+/// The edit target's text, under the same size cap the near-miss code uses.
+fn read_capped(params: &serde_json::Value) -> Option<String> {
+    let path = params.get("path")?.as_str()?;
+    if std::fs::metadata(path).ok()?.len() > SMART_EDIT_MAX_FILE_SIZE {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Wrap an edit_file tool with smart error augmentation.
 pub(crate) fn with_smart_edit(tool: Box<dyn AgentTool>) -> Box<dyn AgentTool> {
     Box::new(SmartEditTool { inner: tool })
@@ -391,6 +435,16 @@ impl AgentTool for SmartEditTool {
         params: serde_json::Value,
         ctx: yoagent::types::ToolContext,
     ) -> Result<yoagent::types::ToolResult, yoagent::types::ToolError> {
+        // CRLF files: a multi-line old_text the model wrote with `\n` is retried
+        // as `\r\n` (only multi-line edits can need it, so only they read the file).
+        let multi_line = params
+            .get("old_text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains('\n'));
+        let params = match multi_line.then(|| read_capped(&params)).flatten() {
+            Some(file) => crlf_adapted_params(&params, &file).unwrap_or(params),
+            None => params,
+        };
         match self.inner.execute(params.clone(), ctx.clone()).await {
             Ok(mut result) => {
                 // Proactive risk feedback: if the edited file is in src/ and has
@@ -407,7 +461,10 @@ impl AgentTool for SmartEditTool {
                     return retry_result;
                 }
                 // No auto-fix possible — augment the error with location info
-                let augmented = self.augment_not_found_error(&msg, &params);
+                let mut augmented = self.augment_not_found_error(&msg, &params);
+                if read_capped(&params).is_some_and(|f| f.contains("\r\n")) {
+                    augmented.push_str(CRLF_NOT_FOUND_NOTE);
+                }
                 Err(yoagent::types::ToolError::Failed(augmented))
             }
             Err(other) => Err(other),
@@ -1914,3 +1971,7 @@ fn beta() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "smart_edit_crlf_tests.rs"]
+mod smart_edit_crlf_tests;
