@@ -130,3 +130,4 @@
 {"day":223,"git_hash":"95bb358f","path":"src/tools_group_kill_tests.rs","ts":"2026-10-09T21:44:03Z"}
 {"day":224,"git_hash":"2358d514","path":"src/model_limits_note.rs","ts":"2026-10-10T11:16:31Z"}
 {"day":225,"git_hash":"1725fefe","path":"src/safety/indirect_command.rs","ts":"2026-10-11T12:27:38Z"}
+{"day":225,"git_hash":"196d8603","path":"src/smart_edit_crlf_tests.rs","ts":"2026-10-12T01:13:32Z"}
