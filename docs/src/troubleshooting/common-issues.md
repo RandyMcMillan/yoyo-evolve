@@ -16,6 +16,15 @@ auto-context — giving you a clean baseline session with only builtin tools. Yo
 ⚠ Safe mode: MCP servers, skills, custom commands, and config disabled
 ```
 
+Project-authored text is kept out of the system prompt too: instruction files
+(`CLAUDE.md`, `YOYO.md`, `.yoyo/instructions.md`), `.yoyo/memory.json`, and the
+project goal file `.yoyo/goal.md`. If a goal file exists, yoyo says so on stderr
+rather than dropping it silently:
+
+```
+⚠ goal file .yoyo/goal.md not loaded into the prompt — --safe-mode skips project-authored text (/goal show still reads it)
+```
+
 Use safe mode to:
 - **Isolate problems**: determine whether an issue is caused by your config or yoyo itself
 - **Recover from broken MCP servers**: if a server crashes on startup, safe mode skips it

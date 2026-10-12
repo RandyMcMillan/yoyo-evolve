@@ -2722,11 +2722,10 @@ directory ({e}); this run is trusted, later runs will not be."
     // every session until cleared (#755). Display paths keep the full text.
     // Behind the directory fence (#1002): a goal.md linking into --deny-dir
     // (or outside --allow-dir) is dropped with a warning, like CLAUDE.md above.
-    if let Some(goal) = crate::commands_goal::goal_for_prompt(&dir_restrictions) {
-        system_prompt.push_str("\n\n# Current Goal\n\n");
-        system_prompt.push_str(&goal);
-        system_prompt
-            .push_str("\n\n(Set via /goal set. The user is working toward this. Keep it in mind.)");
+    // Skipped under --safe-mode like the instruction files and memory.json
+    // (#1002), with a stderr note when a goal file exists.
+    if let Some(block) = crate::commands_goal::goal_block_for_prompt(&dir_restrictions, safe_mode) {
+        system_prompt.push_str(&block);
     }
 
     // --lite: replace system prompt with minimal version for small/local LLMs

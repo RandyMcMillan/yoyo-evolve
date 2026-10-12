@@ -184,6 +184,56 @@ pub(crate) fn goal_file_refused_warning(reason: &str, plain: bool) -> String {
     }
 }
 
+/// The goal's section of the system prompt, ready to append (#1002, safe-mode).
+///
+/// `--safe-mode` (and `--restricted`, which implies it) skips the goal file the
+/// way it already skips CLAUDE.md/YOYO.md and `.yoyo/memory.json`: a cloned repo
+/// can ship `.yoyo/goal.md`, and that text reaches the prompt exactly like
+/// project instructions do. It is skipped **out loud** — one stderr note when the
+/// file exists — so a user who set a goal is not silently left without it. No
+/// goal file means no note. Without safe mode the block is byte-identical to the
+/// one `cli.rs` used to assemble inline. `/goal check` is untouched: it is
+/// trust-gated separately (#761).
+pub fn goal_block_for_prompt(
+    restrictions: &crate::config::DirectoryRestrictions,
+    safe_mode: bool,
+) -> Option<String> {
+    if safe_mode {
+        if let Some(note) = goal_safe_mode_note(&goal_base(), crate::format::is_plain_output()) {
+            eprintln!("{YELLOW}{note}{RESET}");
+        }
+        return None;
+    }
+    goal_for_prompt(restrictions).map(|g| goal_prompt_block(&g))
+}
+
+/// Wrap prompt-ready goal text in its system-prompt section.
+fn goal_prompt_block(goal: &str) -> String {
+    format!(
+        "\n\n# Current Goal\n\n{goal}\n\n(Set via /goal set. The user is working toward this. Keep it in mind.)"
+    )
+}
+
+/// The note printed when `--safe-mode` skips an existing goal file; `None` when
+/// there is no goal file under `dir`, so a project without one stays silent.
+/// Plain output is glyph-free.
+fn goal_safe_mode_note(dir: &Path, plain: bool) -> Option<String> {
+    if !dir.join(GOAL_FILE).exists() {
+        return None;
+    }
+    Some(if plain {
+        format!(
+            "note: goal file {GOAL_FILE} not loaded into the prompt - --safe-mode skips \
+             project-authored text (/goal show still reads it)"
+        )
+    } else {
+        format!(
+            "⚠ goal file {GOAL_FILE} not loaded into the prompt — --safe-mode skips \
+             project-authored text (/goal show still reads it)"
+        )
+    })
+}
+
 fn report_goal_refusal(reason: &str) {
     let msg = goal_file_refused_warning(reason, crate::format::is_plain_output());
     eprintln!("{YELLOW}{msg}{RESET}");
@@ -1527,6 +1577,81 @@ mod fence_tests {
             match handle_goal_fenced("/goal check", &allow(&[&proj, &secret])) {
                 CommandResult::SendToAgent(p) => assert!(p.contains(TOKEN)),
                 _ => panic!("an allowed goal must still be sent"),
+            }
+        });
+    }
+
+    // --- --safe-mode skips the goal file (#1002) ---
+
+    fn plain_goal_dir(text: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".yoyo")).unwrap();
+        std::fs::write(tmp.path().join(GOAL_FILE), text).unwrap();
+        tmp
+    }
+
+    #[test]
+    #[serial]
+    fn safe_mode_drops_the_goal_block() {
+        let tmp = plain_goal_dir(&format!("{TOKEN}\n"));
+        with_goal_base_dir(tmp.path(), || {
+            // Anti-vacuous: the same dir does produce a block without safe mode.
+            let normal = goal_block_for_prompt(&DirectoryRestrictions::default(), false)
+                .expect("fixture must load without --safe-mode");
+            assert!(normal.contains(TOKEN));
+            assert_eq!(
+                goal_block_for_prompt(&DirectoryRestrictions::default(), true),
+                None,
+                "--safe-mode must keep the goal out of the prompt"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn without_safe_mode_the_block_is_byte_identical() {
+        let tmp = plain_goal_dir("  ship the parser ✓\n");
+        with_goal_base_dir(tmp.path(), || {
+            assert_eq!(
+                goal_block_for_prompt(&DirectoryRestrictions::default(), false).as_deref(),
+                Some(
+                    "\n\n# Current Goal\n\nship the parser ✓\n\n(Set via /goal set. \
+                     The user is working toward this. Keep it in mind.)"
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn safe_mode_note_names_the_file_and_the_flag() {
+        let tmp = plain_goal_dir("anything\n");
+        for plain in [true, false] {
+            let note = goal_safe_mode_note(tmp.path(), plain).expect("a goal file exists");
+            assert!(note.contains(GOAL_FILE), "{note}");
+            assert!(note.contains("--safe-mode"), "{note}");
+            assert!(
+                !note.contains("anything"),
+                "the note must not carry the content"
+            );
+            if plain {
+                assert!(note.is_ascii(), "plain output must be glyph-free: {note}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn no_goal_file_means_no_note_and_no_block_in_either_mode() {
+        let tmp = TempDir::new().unwrap();
+        for plain in [true, false] {
+            assert_eq!(goal_safe_mode_note(tmp.path(), plain), None);
+        }
+        with_goal_base_dir(tmp.path(), || {
+            for safe in [true, false] {
+                assert_eq!(
+                    goal_block_for_prompt(&DirectoryRestrictions::default(), safe),
+                    None
+                );
             }
         });
     }

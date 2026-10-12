@@ -137,7 +137,9 @@ It does two things:
 
 1. **Turns on everything `--safe-mode` turns on** — no project-local
    MCP servers, hooks, or `permissions.allow` from the repo's own
-   `.yoyo.toml`.
+   `.yoyo.toml`, and no project-authored text in the system prompt
+   (instruction files, `.yoyo/memory.json`, or the goal file
+   `.yoyo/goal.md`, whose skip is noted on stderr).
 2. **Removes the command-running tools.** Today that is `bash`. yoyo
    prints what it removed at startup, e.g. `🔒 Disabled tools: bash`.
 
