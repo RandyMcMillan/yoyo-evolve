@@ -267,9 +267,7 @@ pub(crate) fn resolve_numeric_setting<T: std::str::FromStr>(
     config_key: &str,
 ) -> (Option<T>, Vec<String>) {
     let mut warnings = Vec::new();
-    let from_flag = args
-        .iter()
-        .position(|a| a == flag_name)
+    let from_flag = option_position(args, &[flag_name]) // #1114: not a value slot
         .and_then(|i| args.get(i + 1))
         .and_then(|s| {
             let parsed = s.parse::<T>().ok();
@@ -302,7 +300,7 @@ fn numeric_flag_refusal<T: std::str::FromStr>(
     flag_name: &str,
     expected: &str,
 ) -> Option<String> {
-    let i = args.iter().position(|a| a == flag_name)?;
+    let i = option_position(args, &[flag_name])?; // #1114
     let value = args.get(i + 1)?;
     if value.parse::<T>().is_ok() {
         return None;
@@ -400,16 +398,29 @@ pub(crate) fn has_option(args: &[String], names: &[&str]) -> bool {
 /// `yoyo --system --thinking high` gives `None`: `--thinking` is the system
 /// prompt there, not a flag.
 pub(crate) fn option_position(args: &[String], names: &[&str]) -> Option<usize> {
+    option_positions(args, names).next()
+}
+
+/// Every index of `names` written as an option, in order: the same walk as
+/// `option_position`, for the repeatable flags (`--deny a --deny b`) and the
+/// numeric lookups. `yoyo --system --deny -p hi` yields nothing.
+pub(crate) fn option_positions<'a>(
+    args: &'a [String],
+    names: &'a [&str],
+) -> impl Iterator<Item = usize> + 'a {
     let opts = option_args(args);
     let mut i = 1;
-    while let Some(a) = opts.get(i) {
-        if names.contains(&a.as_str()) {
-            return Some(i);
+    std::iter::from_fn(move || {
+        while let Some(a) = opts.get(i) {
+            let at = i;
+            let takes_value = crate::cli::FLAGS_NEEDING_VALUES.contains(&a.as_str());
+            i += if takes_value { 2 } else { 1 };
+            if names.contains(&a.as_str()) {
+                return Some(at);
+            }
         }
-        let takes_value = crate::cli::FLAGS_NEEDING_VALUES.contains(&a.as_str());
-        i += if takes_value { 2 } else { 1 };
-    }
-    None
+        None
+    })
 }
 
 /// The words after `--`: prompt text, verbatim, never parsed as flags.
@@ -430,6 +441,53 @@ pub(crate) fn prompt_text(args: &[String], p_value: Option<String>) -> Option<St
             (!pos.is_empty()).then(|| pos.join(" "))
         }
     }
+}
+
+/// Bare words a `-p` run would drop (#1150): with `-p`/`--prompt` set,
+/// [`prompt_text`] sends `-p`'s value plus the words after `--`, so a bare
+/// word anywhere else (`yoyo -p hi extra`, `yoyo --system --model claude-zzz
+/// -p hi`) never reached the model and nothing said so. Values of
+/// `FLAGS_NEEDING_VALUES` flags and words after `--` are not stray. `-p ""`
+/// counts as unset, as in `flag_value`, because then the bare words ARE the
+/// prompt. Reads the option position without `flag_value`'s warning.
+pub(crate) fn stray_prompt_words(args: &[String]) -> Vec<String> {
+    let opts = option_args(args);
+    let p_set = option_position(args, &["-p", "--prompt"])
+        .and_then(|i| opts.get(i + 1))
+        .is_some_and(|v| !v.trim().is_empty());
+    if !p_set {
+        return Vec::new();
+    }
+    let mut pos = crate::cli::collect_positional_args(args, crate::cli::FLAGS_NEEDING_VALUES);
+    pos.truncate(pos.len().saturating_sub(operand_args(args).len()));
+    pos
+}
+
+/// The exit-2 refusal for [`stray_prompt_words`], or None. Names each word
+/// and shows both ways to keep it, built from the user's own words.
+pub(crate) fn stray_prompt_word_refusal(args: &[String]) -> Option<String> {
+    let stray = stray_prompt_words(args);
+    if stray.is_empty() {
+        return None;
+    }
+    let show = |w: &String| crate::cli::sanitize_for_display(w);
+    let p = option_position(args, &["-p", "--prompt"])
+        .and_then(|i| option_args(args).get(i + 1))
+        .map(show)
+        .unwrap_or_default();
+    let words: Vec<String> = stray.iter().map(show).collect();
+    let quoted: Vec<String> = words.iter().map(|w| format!("'{w}'")).collect();
+    let (noun, verb) = match stray.len() {
+        1 => ("word", "is"),
+        _ => ("words", "are"),
+    };
+    Some(format!(
+        "{noun} {} {verb} not part of -p's value and would be dropped. \
+Quote the whole prompt (-p \"{p} {all}\") or put the extra words after -- \
+(-p \"{p}\" -- {all}). Nothing was sent to the model.",
+        quoted.join(", "),
+        all = words.join(" "),
+    ))
 }
 
 /// Startup refusal for flag-shaped tokens that are not in `KNOWN_FLAGS`
@@ -695,6 +753,49 @@ Run yoyo --help for the list of flags.",
         let out = unknown_flag_refusal(&argv(&["--x\u{1b}[31m"])).unwrap();
         assert!("--x\u{1b}[31m".as_bytes().contains(&0x1b)); // anti-vacuous
         assert!(!out.as_bytes().contains(&0x1b), "{out:?}");
+    }
+
+    /// #1150: a bare word beside `-p` is stray; the near-misses are not.
+    #[test]
+    fn stray_prompt_words_table() {
+        let rows: &[(&[&str], &[&str])] = &[
+            (&["-p", "hi", "extra"], &["extra"]),
+            (&["extra", "-p", "hi"], &["extra"]),
+            (&["--model", "x", "-p", "hi", "y", "z"], &["y", "z"]),
+            (
+                &["--system", "--model", "claude-zzz", "-p", "hi"],
+                &["claude-zzz"],
+            ),
+            (&["--prompt", "hi", "extra"], &["extra"]),
+            // Near-misses: nothing is dropped, so nothing is stray.
+            (&["-p", "hi"], &[]),
+            (&["-p", "hi extra"], &[]),
+            (&["-p", "hi", "--", "extra"], &[]),
+            (&["-p", "--", "hi", "extra"], &[]), // `-p --` takes the rest
+            (&["--model", "x", "-p", "hi"], &[]), // a flag's value
+            (&["--system", "-p", "hi"], &[]),    // -p is --system's value
+            (&["hi", "extra"], &[]),             // no -p: words ARE the prompt
+            (&["-p", "", "hi"], &[]),            // empty -p: "hi" is the prompt
+            (&["--", "-p", "hi", "x"], &[]),     // -p after -- is text
+        ];
+        for (rest, want) in rows {
+            let a = argv(rest);
+            assert_eq!(stray_prompt_words(&a), argv(want)[1..], "{rest:?}");
+            assert_eq!(
+                stray_prompt_word_refusal(&a).is_some(),
+                !want.is_empty(),
+                "{rest:?}"
+            );
+        }
+        let msg = stray_prompt_word_refusal(&argv(&["-p", "hi", "extra"])).unwrap();
+        assert_eq!(
+            msg,
+            "word 'extra' is not part of -p's value and would be dropped. \
+Quote the whole prompt (-p \"hi extra\") or put the extra words after -- \
+(-p \"hi\" -- extra). Nothing was sent to the model."
+        );
+        let esc = stray_prompt_word_refusal(&argv(&["-p", "hi", "x\u{1b}[31m"])).unwrap();
+        assert!(!esc.as_bytes().contains(&0x1b), "{esc:?}");
     }
 
     fn cfg(key: &str, value: &str) -> std::collections::HashMap<String, String> {
