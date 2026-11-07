@@ -23,6 +23,8 @@ permissions:
 
 jobs:
   skill-evolve:
+    # Forks have no APP_ID/APP_PRIVATE_KEY secrets, so token generation fails there.
+    if: github.repository == 'yologdev/yoyo-evolve'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
