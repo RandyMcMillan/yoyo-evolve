@@ -8,6 +8,17 @@ Everything below was moved verbatim out of CLAUDE.md on 2026-09-15, as one conti
 
 ---
 
+### `.github/workflows/ci.yml` + `scripts/rebase_fork.py` — fork CI preparation
+
+CI checks GitHub repository metadata after a full-history checkout. Non-forks
+continue unchanged; forks rebase the checked-out commit (including detached PR
+checkouts) onto the immediate parent's default branch before any checks run.
+This is checkout-only: no remote branch is pushed or rewritten. Metadata,
+fetch, and rebase failures stop CI; conflicting rebases are aborted. The parent
+and its branch come from GitHub, not a hardcoded repository or branch name.
+`scripts/test_rebase_fork.py` exercises real temporary Git repositories and is
+included in CI's existing Python unittest discovery.
+
 **Module-size gate** (`tests/module_size.rs`): a deterministic line-count check over `src/`, holding `MAX_MODULE_LINES = 2000` plus a `GRANDFATHERED_OVERSIZED_MODULES` debt register of `(file, recorded_lines)` entries. Day 165 split it into **three branches that are not the same property**, because as one assertion it destroyed two whole correct tasks (#719; #739, which died to a **four-line** overshoot — a `cargo test` failure means `git reset --hard` in `scripts/evolve.sh`, so the gate's real price was never the sentence it asked for):
 
 The three branches, and the two directions they run in:
