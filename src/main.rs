@@ -42,12 +42,16 @@ mod agent_limits_tests;
 mod anthropic_preset_tests;
 mod auto_check_scope;
 mod banner;
+mod bash_output_cap;
+mod bash_parse;
 #[cfg(test)]
 mod bash_refusal_tests;
 mod cd_allow;
 mod cd_config_note;
 mod cd_deny;
 mod cd_hooks;
+#[cfg(test)]
+mod checkpoint_stop_tests;
 mod cli;
 mod cli_config;
 mod commands;
@@ -114,7 +118,10 @@ mod commands_update;
 mod commands_web;
 mod config;
 mod config_paths;
+mod config_secret;
 mod config_syntax;
+mod config_unknown_keys;
+mod config_value;
 mod context;
 #[cfg(test)]
 mod context_fence_tests;
@@ -145,6 +152,8 @@ mod outside_read;
 mod partial_read_guard;
 #[cfg(test)]
 mod provider_presets_tests;
+#[cfg(test)]
+mod shell_form_tests;
 mod spawn_worktree;
 mod spawn_write_tap;
 mod subprocess_env;
@@ -183,6 +192,7 @@ mod hooks;
 #[cfg(test)]
 mod main_tests;
 mod memory;
+mod project_base_url;
 mod prompt;
 mod prompt_budget;
 mod prompt_retry;
@@ -221,7 +231,7 @@ use prompt::{
     run_prompt_with_content_and_changes, PromptOutcome,
 };
 use prompt_budget::enable_audit_log;
-use prompt_utils::write_output_file;
+use prompt_utils::{skip_output_file_for_failed_run, write_output_file};
 use session::SessionChanges;
 use watch::{get_watch_command, run_watch_after_prompt};
 
@@ -299,7 +309,7 @@ fn build_json_output_with(
         // and `is_error` agrees with the exit code `exit_code_for_outcome`
         // gives the same outcome (before, it read only `run_failed`, so a
         // default-limit cut or a refusal exited 1 with `is_error: false`).
-        "is_error": is_error || prompt::incomplete_forces_failure(response.incomplete),
+        "is_error": run_failed_overall(response, is_error),
         "incomplete": prompt::incomplete_json(response.incomplete),
         "session": session_changes.to_json_summary(),
         // #895: a script must be able to tell a DEGRADED run from a healthy one.
@@ -428,7 +438,55 @@ fn emit_output(
     // for them together is the natural thing to do — and until #766 the file
     // write was simply skipped under the other two branches, with no file, no
     // error, and nothing on stderr to notice.
+    //
+    // #1218: but only a run that HAS a product writes it. #1214's reason for
+    // replacing ("the file is the run's own output") does not cover a failed
+    // run, which used to wipe the last good answer with its empty text. Like
+    // `curl -o`, a failed run neither replaces nor creates the file, and says
+    // so; the exit code stays what the failure already made it.
+    write_output_for_outcome(response, is_error, output_path)
+}
+
+/// The `--output` gate every mode goes through (#1219: stream-json too, which
+/// returns before `emit_output`): a failed or interrupted run keeps the file
+/// as it was and says so; otherwise the answer replaces it. Returns true only
+/// when a write was attempted and failed (#766: that alone fails the run).
+fn write_output_for_outcome(
+    response: &PromptOutcome,
+    is_error: bool,
+    output_path: &Option<String>,
+) -> bool {
+    if run_failed_overall(response, is_error) {
+        skip_output_file_for_failed_run(output_path, prompt::interrupted_exit_code().is_some());
+        return false;
+    }
     write_output_file(output_path, &response.text).is_err()
+}
+
+/// #1219: the exit code of a finished stream-json run. stdout carried the
+/// NDJSON stream; `-o` gets the final answer under the same rules as every
+/// other mode, and a Ctrl+C mid-turn exits 130 like `-p` (#993).
+fn stream_json_exit_code(response: &PromptOutcome, output_path: &Option<String>) -> i32 {
+    let is_error = response.last_api_error.is_some();
+    let output_write_failed = write_output_for_outcome(response, is_error, output_path);
+    let code = i32::from(
+        is_error || prompt::incomplete_forces_failure(response.incomplete) || output_write_failed,
+    );
+    prompt::interrupted_exit_code().unwrap_or(code)
+}
+
+/// #1218: the "no complete answer" half of the exit-1 rule, the same value
+/// the json envelope reports as `is_error`: the caller's failure (API error,
+/// dead turn) or a final reply that `incomplete_forces_failure` (a refusal,
+/// a cut at a limit nobody set). One function so `-o` and `is_error` agree.
+///
+/// #1220: a run a signal cut short (exit 130/143/129/131, the same
+/// `interrupted_exit_code` the exit ladder reads) is not a complete answer
+/// either, so it is in this predicate and `-o` keeps the old file.
+fn run_failed_overall(response: &PromptOutcome, is_error: bool) -> bool {
+    is_error
+        || prompt::incomplete_forces_failure(response.incomplete)
+        || prompt::interrupted_exit_code().is_some()
 }
 
 /// #966: `--print` and the JSON envelope both make `emit_output` the single
@@ -526,10 +584,7 @@ async fn run_single_prompt(
             )
             .await
         };
-        let code = i32::from(
-            response.last_api_error.is_some()
-                || prompt::incomplete_forces_failure(response.incomplete),
-        );
+        let code = stream_json_exit_code(&response, output_path);
         let code = save_session_after_turn(agent, save_session, code).await;
         if code != 0 {
             exit_after_shutdown(code).await;
@@ -790,6 +845,7 @@ fn slash_command_refusal(input: &str, door: PromptDoor) -> Option<String> {
 /// * `had_error`  — `last_tool_error` or `last_api_error` from the last turn.
 /// * `budget_exhausted` — `prompt_budget::session_budget_exhausted(30)`.
 /// * `predicate`  — `repl::should_auto_continue(..)`, the shared decision.
+/// * `checkpoint_stopped` — `CHECKPOINT_TRIGGERED` (sticky: one run). #1161.
 fn piped_should_continue(
     opted_in: bool,
     count: u32,
@@ -797,8 +853,13 @@ fn piped_should_continue(
     had_error: bool,
     budget_exhausted: bool,
     predicate: bool,
+    checkpoint_stopped: bool,
 ) -> bool {
-    opted_in && count < max && !had_error && !budget_exhausted && predicate
+    opted_in
+        && count < max
+        && !had_error
+        && !budget_exhausted
+        && repl::auto_continue_allowed(checkpoint_stopped, predicate)
 }
 
 async fn run_piped_mode(
@@ -848,10 +909,7 @@ async fn run_piped_mode(
             &session_changes,
         )
         .await;
-        let code = i32::from(
-            response.last_api_error.is_some()
-                || prompt::incomplete_forces_failure(response.incomplete),
-        );
+        let code = stream_json_exit_code(&response, output_path);
         let code = save_session_after_turn(agent, save_session, code).await;
         if code != 0 {
             exit_after_shutdown(code).await;
@@ -951,6 +1009,7 @@ async fn run_piped_mode(
                 ran_tools,
                 opted_in,
             ),
+            CHECKPOINT_TRIGGERED.load(Ordering::SeqCst),
         ) {
             auto_continue_count += 1;
             if !print_mode && !format::is_quiet() {
@@ -1155,8 +1214,42 @@ fn apply_bedrock_credentials(agent_config: &mut AgentConfig) {
 /// #978: write exactly what `/save <path>` writes (`agent.save_messages()`).
 /// Never creates a missing parent directory: a bad path must fail loudly.
 fn save_session_to(agent: &Agent, path: &std::path::Path) -> Result<(), String> {
+    // #1214: re-checked at write time, since the file may have appeared mid-run.
+    if let Some(why) = save_session_target_problem(path) {
+        return Err(why);
+    }
     let json = agent.save_messages().map_err(|e| e.to_string())?;
     std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// #1214: why `--save-session` must not replace `path`, or None. A missing
+/// path is written; an existing one is replaced only if it parses the way
+/// `restore_messages` (/load, --continue) parses a session, so re-runs and
+/// resumes still work while a user's other file is never clobbered.
+fn save_session_target_problem(path: &std::path::Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let detail = match non_regular_read::read_regular_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Vec<yoagent::AgentMessage>>(&text) {
+            Ok(_) => return None,
+            Err(e) => e.to_string(),
+        },
+        Err(e) => format!("could not read it: {e}"),
+    };
+    Some(format!(
+        "it exists and is not a yoyo session file ({detail}), so it was not replaced"
+    ))
+}
+
+/// #1214: the startup refusal, checked before any request is sent.
+fn save_session_target_refusal(path: &std::path::Path) -> Option<String> {
+    let why = save_session_target_problem(path)?;
+    Some(format!(
+        "error: --save-session: {}: {}. Choose another path, or move that file away first.",
+        cli::sanitize_for_display(&path.display().to_string()),
+        cli::sanitize_for_display(&why)
+    ))
 }
 
 /// The `--save-session` failure line; both strings are sanitized.
@@ -1252,6 +1345,8 @@ async fn restore_session(agent: &mut Agent, strict: bool) {
     let session_path = commands_session::continue_session_path();
     match restore_session_result(agent, std::path::Path::new(session_path)) {
         Ok(n) => {
+            // #1211: the restored file is this process's own; /save may replace it.
+            commands_session::record_own_session_file(session_path);
             // #1005: restore the /todo list saved with this session.
             if let Some(w) =
                 commands_todo::restore_session_todos(std::path::Path::new(session_path))
@@ -1369,6 +1464,16 @@ async fn main() {
         );
     }
 
+    // #1214: refuse a --save-session target that is someone else's file
+    // before any server is spawned or request sent.
+    if let Some(msg) = config
+        .save_session
+        .as_deref()
+        .and_then(save_session_target_refusal)
+    {
+        eprintln!("{msg}");
+        dispatch_sub::exit_process(2);
+    }
     let continue_session = config.continue_session;
     let output_path = config.output_path;
     // In safe mode, skip MCP servers, skills, custom commands, and config

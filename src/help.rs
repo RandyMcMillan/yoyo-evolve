@@ -81,7 +81,7 @@ pub fn cli_help_text() -> String {
     );
     let _ = writeln!(
         s,
-        "  --max-tokens <n>  Maximum output tokens per response (default: 8192)"
+        "  --max-tokens <n>  Maximum output tokens per response (default: per model, from its preset or the provider)"
     );
     let _ = writeln!(
         s,
@@ -89,7 +89,7 @@ pub fn cli_help_text() -> String {
     );
     let _ = writeln!(
         s,
-        "  --temperature <f> Sampling temperature (0.0-1.0, default: model default)"
+        "  --temperature <f> Sampling temperature (0.0-1.0; 0.0-2.0 where the provider documents it)"
     );
     let _ = writeln!(s, "  --skills <dir>    Directory containing skill files");
     let _ = writeln!(
@@ -507,7 +507,10 @@ pub fn cli_help_text() -> String {
         s,
         "    /compact [N|all]   Compact conversation to save context"
     );
-    let _ = writeln!(s, "    /save [path]       Save session to file");
+    let _ = writeln!(
+        s,
+        "    /save [path]       Save session to file (--force to replace)"
+    );
     let _ = writeln!(s, "    /load [path]       Load session from file");
     let _ = writeln!(s, "    /retry             Re-send the last user input");
     let _ = writeln!(s, "    /status            Show session info");
@@ -550,7 +553,7 @@ pub fn cli_help_text() -> String {
         s,
         "    /evolution [N]     Show evolution history and session stats"
     );
-    let _ = writeln!(s, "    /export [path]     Export conversation as markdown");
+    let _ = writeln!(s, "    /export [path] [--force]  Export conversation as markdown (no overwrite without --force)");
     let _ = writeln!(
         s,
         "    /stash [desc]      Stash conversation and start fresh"
@@ -890,7 +893,7 @@ pub fn help_text() -> String {
     out.push_str("  /changelog [N]     Show recent git commit history (default: 15, max: 100)\n");
     out.push_str("  /evolution [N]     Show evolution history, session stats, and CI runs\n");
     out.push_str(
-        "  /export [path]     Export conversation as readable markdown (default: conversation.md)\n",
+        "  /export [path] [--force]  Export conversation as markdown (default: conversation.md; refuses to overwrite an existing file without --force)\n",
     );
     out.push_str(
         "  /copy [last|code]  Copy text to the system clipboard (last message, code block, etc.)\n",

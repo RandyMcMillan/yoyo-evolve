@@ -76,10 +76,11 @@ yoyo --provider custom --base-url http://localhost:8080/v1 --model my-model
 yoyo resolves your API key in this order:
 
 1. `--api-key` CLI flag (highest priority)
-2. Provider-specific environment variable (e.g., `OPENAI_API_KEY` for `--provider openai`)
-3. `ANTHROPIC_API_KEY` environment variable (fallback)
-4. `API_KEY` environment variable (generic fallback)
-5. `api_key` in config file (see below)
+2. Provider-specific environment variable (e.g., `OPENAI_API_KEY` for `--provider openai`, `ANTHROPIC_API_KEY` for `--provider anthropic`)
+3. `API_KEY` environment variable (generic fallback, for any provider)
+4. `api_key` in config file (see below)
+
+`ANTHROPIC_API_KEY` is only ever sent to the `anthropic` provider. Up to yoyo 0.4.0 it was also the fallback key for every other provider, so an Anthropic key in your shell went as a bearer token to ollama, a `--provider custom` proxy, OpenAI, Bedrock and so on whenever their own variable was unset. Now a provider that needs a key and has none stops with `No API key found` naming its own variable, and `ollama` / `custom` run with no key (#1170).
 
 Set one of them:
 
@@ -101,6 +102,7 @@ yoyo supports a TOML-style config file so you don't have to pass flags every tim
 2. `~/.yoyo.toml` (home directory shorthand)
 3. `~/.config/yoyo/config.toml` (XDG user-level)
 
+yoyo reads exactly one of these files; they are never merged. A project `.yoyo.toml` shadowing your home config is the intended layering and is silent, but if both `~/.yoyo.toml` and `~/.config/yoyo/config.toml` exist, every run warns once on stderr that the second is ignored, and `yoyo config get <key>` names a skipped file that sets the key. A value yoyo reads as unset (an empty or blank `model = ""`, a boolean that is not `true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`, a number that does not parse) is shown as such: `yoyo config get model` prints `model is not set: .yoyo.toml has model = "", which yoyo reads as unset (using default)`, and `yoyo config show` marks the line `(read as unset; using default)`. `provider = ""` and `thinking = ""` are not unset: without a `base_url` the first is refused as an unknown provider, and the second warns and runs at medium. When the run uses a different value than the one written, `config get` and `config show` name it after the line: `thinking = ""` and `thinking = "bogus"` show `(read as medium)`, `thinking = "max"` shows `(read as high)` (yoyo sends no tier above high), `temperature = 5` shows `(read as 1.0)` (the run clamps to the provider's range: 0.0–2.0 on `openai`, `google`, `deepseek`, `groq` and `cerebras`, 0.0–1.0 elsewhere, so with `provider = "openai"` it shows `(read as 2.0)` and `temperature = 1.5` is used as written), `max_auto_continues = 50` shows `(read as 20)`, a boolean synonym such as `yes` shows `(read as true)`, and an unknown or retired `provider` says startup refuses it unless a base URL is given.
 **Example `.yoyo.toml`:**
 
 ```toml
@@ -115,7 +117,7 @@ api_key = "sk-ant-api03-..."
 # Generation settings
 max_tokens = 8192
 max_turns = 50
-# temperature = 0.7  # ignored (with a stderr note) on Claude 4.7 and later, which reject it
+# temperature = 0.7  # ignored (with a stderr note) on Claude 4.7+ and GPT-6, which take none
 # An unparseable max_tokens / max_turns / temperature / context_window
 # (e.g. "abc", -5) prints a warning on stderr and falls back to the default.
 
@@ -141,6 +143,10 @@ deny = ["rm -rf *", "sudo *"]
 allow = ["./src", "./tests"]
 deny = ["~/.ssh", "/etc"]
 ```
+
+A key yoyo does not read (a typo such as `modle = "gpt-4o"`, or a misspelled section such as `[permisions]`) is not an error: the run goes ahead without it, and yoyo prints one stderr warning per such key naming the file, the line and the closest key it does read. Hook keys are top-level dotted keys (`hooks.pre.bash = "..."`); any spelling TOML reads as the same key (`[hooks.pre]` then `bash = "..."`, or an inline table) works too.
+
+Settings such as `model`, `provider` and `base_url` follow TOML's rule: a top-level key goes **before the first `[section]` header**. Written under a header (`[permissions]` then `provider = "openai"`), the key belongs to that table, so yoyo does not use it as the setting and warns that it has no effect. Before this was fixed, such a line silently replaced the top-level value.
 
 CLI flags always override config file values. For example, `--model gpt-4o` overrides `model = "claude-sonnet-5-5"` from the config file.
 

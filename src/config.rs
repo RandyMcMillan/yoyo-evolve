@@ -39,6 +39,7 @@ impl PermissionConfig {
                 && !allow_wildcard_swallows_options(pattern, command)
                 && !allow_wildcard_spans_a_command_chain(pattern, command)
                 && !allow_wildcard_reaches_cloud_metadata(pattern, command)
+                && !crate::bash_parse::allow_wildcard_not_one_plain_command(pattern, command)
             {
                 return Some(true);
             }
@@ -476,90 +477,34 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Parse a TOML-style array value like `["pattern1", "pattern2"]` into a Vec<String>.
+/// Test-only since Day 265: deletion debt for #1184. No production code reads
+/// it (`mcp` goes through [`parse_mcp_list_from_config`]); its tests still need
+/// moving to the parsed reader before it can be deleted.
+#[cfg(test)]
 pub fn parse_toml_array(value: &str) -> Vec<String> {
-    let trimmed = value.trim();
-    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-        return Vec::new();
-    }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    inner
-        .split(',')
-        .map(|s| {
-            let s = s.trim();
-            // Strip quotes
-            if (s.starts_with('"') && s.ends_with('"'))
-                || (s.starts_with('\'') && s.ends_with('\''))
-            {
-                s[1..s.len() - 1].to_string()
-            } else {
-                s.to_string()
-            }
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
+    crate::config_value::read_array(value).unwrap_or_default()
 }
 
-/// Parse a `[permissions]` section from a TOML config file content.
-/// Looks for `allow = [...]` and `deny = [...]` lines under `[permissions]`.
+/// The `[permissions]` table, read through the `toml` crate (#1184): every
+/// TOML spelling of `allow` / `deny` (an array over several lines, a dotted
+/// `permissions.deny`, an inline table) builds the same fence. A file that is
+/// not TOML reads as no rules; the load gate refuses it before anything runs.
+/// A list that is only partly read is named by `config_value`'s warning.
 pub fn parse_permissions_from_config(content: &str) -> PermissionConfig {
-    let mut config = PermissionConfig::default();
-    let mut in_permissions = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // Check for section headers
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_permissions = trimmed == "[permissions]";
-            continue;
-        }
-        if !in_permissions {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "allow" => config.allow = parse_toml_array(value),
-                "deny" => config.deny = parse_toml_array(value),
-                _ => {}
-            }
-        }
+    let doc = config_toml_read::parse_table(content);
+    PermissionConfig {
+        allow: config_toml_read::fence_list(&doc, "permissions", "allow").0,
+        deny: config_toml_read::fence_list(&doc, "permissions", "deny").0,
     }
-    config
 }
 
-/// Parse a `[directories]` section from a TOML config file content.
-/// Looks for `allow = [...]` and `deny = [...]` lines under `[directories]`.
+/// The `[directories]` table, read exactly like [`parse_permissions_from_config`].
 pub fn parse_directories_from_config(content: &str) -> DirectoryRestrictions {
-    let mut config = DirectoryRestrictions::default();
-    let mut in_directories = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_directories = trimmed == "[directories]";
-            continue;
-        }
-        if !in_directories {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "allow" => config.allow = parse_toml_array(value),
-                "deny" => config.deny = parse_toml_array(value),
-                _ => {}
-            }
-        }
+    let doc = config_toml_read::parse_table(content);
+    DirectoryRestrictions {
+        allow: config_toml_read::fence_list(&doc, "directories", "allow").0,
+        deny: config_toml_read::fence_list(&doc, "directories", "deny").0,
     }
-    config
 }
 
 /// Glob metacharacters that make a `[directories]` entry unmatchable (#823).
@@ -676,9 +621,12 @@ pub(crate) fn directory_wildcard_warning(
     Some(msg)
 }
 
-/// Parse `[mcp_servers.<name>]` sections from raw config content.
+/// Read the `mcp_servers` table from raw config content, through the `toml`
+/// crate (#1182), so every TOML spelling of it reads the same: the header form
+/// below, `[mcp_servers]` then `fs = { ... }`, a top-level inline table, dotted
+/// keys. See `config_toml_read.rs`.
 ///
-/// Each section defines a named MCP server with a command, optional args, and optional env vars:
+/// Each server defines a named MCP server with a command, optional args, and optional env vars:
 /// ```toml
 /// [mcp_servers.filesystem]
 /// command = "npx"
@@ -690,98 +638,16 @@ pub(crate) fn directory_wildcard_warning(
 /// env = { DATABASE_URL = "postgresql://localhost/mydb" }
 /// ```
 pub fn parse_mcp_servers_from_config(content: &str) -> Vec<McpServerConfig> {
-    let mut servers: Vec<McpServerConfig> = Vec::new();
-    let mut current_name: Option<String> = None;
-    let mut current_command: Option<String> = None;
-    let mut current_args: Vec<String> = Vec::new();
-    let mut current_env: Vec<(String, String)> = Vec::new();
-
-    // Helper: flush accumulated server data into the result vec
-    let flush = |name: &mut Option<String>,
-                 command: &mut Option<String>,
-                 args: &mut Vec<String>,
-                 env: &mut Vec<(String, String)>,
-                 servers: &mut Vec<McpServerConfig>| {
-        if let (Some(n), Some(c)) = (name.take(), command.take()) {
-            servers.push(McpServerConfig {
-                name: n,
-                command: c,
-                args: std::mem::take(args),
-                env: std::mem::take(env),
-            });
-        } else {
-            // Reset even if incomplete
-            *name = None;
-            *command = None;
-            args.clear();
-            env.clear();
-        }
-    };
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Detect section headers
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            // Flush any previous MCP server
-            flush(
-                &mut current_name,
-                &mut current_command,
-                &mut current_args,
-                &mut current_env,
-                &mut servers,
-            );
-
-            let section = &trimmed[1..trimmed.len() - 1];
-            if let Some(name) = section.strip_prefix("mcp_servers.") {
-                let name = name.trim();
-                if !name.is_empty() {
-                    current_name = Some(name.to_string());
-                }
-            }
-            continue;
-        }
-
-        // Only parse key=value lines inside an mcp_servers section
-        if current_name.is_none() {
-            continue;
-        }
-
-        if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "command" => {
-                    let v = strip_quotes(value);
-                    if !v.is_empty() {
-                        current_command = Some(v);
-                    }
-                }
-                "args" => {
-                    current_args = parse_toml_array(value);
-                }
-                "env" => {
-                    current_env = parse_inline_table(value);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Flush the last server
-    flush(
-        &mut current_name,
-        &mut current_command,
-        &mut current_args,
-        &mut current_env,
-        &mut servers,
-    );
-
-    servers
+    config_toml_read::mcp_servers_from_table(&config_toml_read::parse_table(content))
 }
+
+/// The top-level `mcp = [...]` commands, read from the parsed TOML (#1184).
+pub fn parse_mcp_list_from_config(content: &str) -> Vec<String> {
+    config_toml_read::mcp_list_from_table(&config_toml_read::parse_table(content))
+}
+
+#[path = "config_toml_read.rs"]
+pub(crate) mod config_toml_read;
 
 /// Which end of a config value carries invisible whitespace padding.
 ///
@@ -835,22 +701,23 @@ pub(crate) fn padding_end(raw: &str) -> Option<PaddingEnd> {
 ///
 /// **Why this exists (measured Day 193, in a tempdir, through the real parsers).** A
 /// quoted TOML value preserves its inner padding all the way to the resolved value:
-/// `strip_quotes` trims *outside* the quotes and then strips them, so
-/// `command = "npx "` resolves to `"npx "` and the spawn silently fails with no error,
-/// no output, and no way for a user to tell it from a server that started and did
-/// nothing. An **unquoted** `command = npx ` is trimmed away by that same `trim()`, so
-/// the safe-looking idiom — quote your values — is the one that keeps the invisible
-/// byte. Same class as #892's unreachable hook key: accepted vocabulary, no validation.
+/// `command = "npx "` resolves to `"npx "` (TOML keeps what is inside the quotes) and
+/// the spawn silently fails with no error, no output, and no way for a user to tell it
+/// from a server that started and did nothing. (Superseded, recorded rather than erased:
+/// the Day-193 hand reader also trimmed an unquoted `command = npx `; since #1184 the
+/// load gate refuses an unquoted value outright.) Same class as #892's unreachable hook
+/// key: accepted vocabulary, no validation.
 ///
 /// **No third parser.** This is pure over the values the two existing MCP parsers
-/// already produced (`parse_toml_array` for `mcp = [...]`, `parse_mcp_servers_from_config`
+/// already produced (`parse_mcp_list_from_config` for `mcp = [...]`, `parse_mcp_servers_from_config`
 /// for `[mcp_servers.*]`), so "what is an MCP value" has exactly one statement per door
 /// and this cannot drift from either. Returns `(key label, raw value)` pairs in config
 /// order; an empty vec means every value is clean.
 ///
-/// Scope is **MCP values only**. `parse_toml_array` is shared with `[permissions]` and
-/// `[directories]`, so detection deliberately does not live inside it — a warning there
-/// would fire on glob patterns this task never measured.
+/// Scope is **MCP values only**. `parse_toml_array` (the `mcp` reader until Day 265) was
+/// shared with `[permissions]` and `[directories]` (until Day 262, #1184), so
+/// detection deliberately does not live inside it; a warning there would have fired on
+/// glob patterns this task never measured.
 pub(crate) fn whitespace_padded_config_values(
     config_servers: &[String],
     server_configs: &[McpServerConfig],
@@ -930,48 +797,6 @@ pub(crate) fn config_whitespace_warning(
         "\n  A quoted TOML value keeps its padding; an unquoted one does not. Remove the space inside the quotes if it was not intended.",
     );
     Some(msg)
-}
-
-/// Strip surrounding quotes from a TOML string value.
-fn strip_quotes(s: &str) -> String {
-    let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        if s.len() >= 2 {
-            s[1..s.len() - 1].to_string()
-        } else {
-            String::new()
-        }
-    } else {
-        s.to_string()
-    }
-}
-
-/// Parse a simple inline TOML table like `{ KEY = "value", KEY2 = "value2" }`.
-/// Returns a list of (key, value) pairs.
-fn parse_inline_table(s: &str) -> Vec<(String, String)> {
-    let s = s.trim();
-    // Strip surrounding braces
-    let inner = if s.starts_with('{') && s.ends_with('}') {
-        &s[1..s.len() - 1]
-    } else {
-        return Vec::new();
-    };
-
-    let mut result = Vec::new();
-    for pair in inner.split(',') {
-        let pair = pair.trim();
-        if pair.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = pair.split_once('=') {
-            let k = k.trim().to_string();
-            let v = strip_quotes(v);
-            if !k.is_empty() {
-                result.push((k, v));
-            }
-        }
-    }
-    result
 }
 
 /// Configuration for an MCP (Model Context Protocol) server defined in config TOML sections.
@@ -1269,7 +1094,8 @@ impl ModelPricingOverrides {
     }
 }
 
-/// Parse `[model_pricing."<model-id>"]` tables out of raw config content.
+/// Read the `model_pricing` table out of raw config content, through the
+/// `toml` crate (#1182): any spelling of the table reads the same.
 ///
 /// ```toml
 /// [model_pricing."my-model-id"]
@@ -1289,100 +1115,7 @@ impl ModelPricingOverrides {
 ///   marginal cost per million tokens really is zero is the motivating case
 ///   for this feature. Do not "fix" this into a refusal.
 pub fn parse_model_pricing_from_config(content: &str) -> ModelPricingOverrides {
-    let mut out = ModelPricingOverrides::default();
-    let mut current: Option<String> = None;
-    let mut input: Option<f64> = None;
-    let mut output: Option<f64> = None;
-    let mut saw_bad_value = false;
-
-    fn flush(
-        current: &mut Option<String>,
-        input: &mut Option<f64>,
-        output: &mut Option<f64>,
-        saw_bad_value: &mut bool,
-        out: &mut ModelPricingOverrides,
-    ) {
-        let name = match current.take() {
-            Some(n) => n,
-            None => {
-                *input = None;
-                *output = None;
-                *saw_bad_value = false;
-                return;
-            }
-        };
-        match (input.take(), output.take()) {
-            (Some(i), Some(o)) if !*saw_bad_value => {
-                out.entries.push((
-                    name,
-                    ModelPrice {
-                        input_per_million: i,
-                        output_per_million: o,
-                    },
-                ));
-            }
-            _ => out.dropped.push(name),
-        }
-        *saw_bad_value = false;
-    }
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            flush(
-                &mut current,
-                &mut input,
-                &mut output,
-                &mut saw_bad_value,
-                &mut out,
-            );
-            let section = &trimmed[1..trimmed.len() - 1];
-            if let Some(id) = section.strip_prefix("model_pricing.") {
-                let id = strip_quotes(id.trim());
-                if !id.is_empty() {
-                    current = Some(id);
-                }
-            }
-            continue;
-        }
-
-        if current.is_none() {
-            continue;
-        }
-
-        if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            if key != "input" && key != "output" {
-                continue;
-            }
-            // Strip a trailing `# comment` before parsing the number.
-            let value = value.split('#').next().unwrap_or("").trim();
-            // A rate must be a real, non-negative number. Zero is allowed on
-            // purpose (see the doc comment); negative and NaN are not.
-            match value.parse::<f64>() {
-                Ok(v) if v.is_finite() && v >= 0.0 => {
-                    if key == "input" {
-                        input = Some(v);
-                    } else {
-                        output = Some(v);
-                    }
-                }
-                _ => saw_bad_value = true,
-            }
-        }
-    }
-    flush(
-        &mut current,
-        &mut input,
-        &mut output,
-        &mut saw_bad_value,
-        &mut out,
-    );
-    out
+    config_toml_read::model_pricing_from_table(&config_toml_read::parse_table(content))
 }
 
 /// Keys that `/config set` understands. Each entry is a key name and a
@@ -1395,7 +1128,10 @@ pub const SETTABLE_KEYS: &[(&str, &str)] = &[
     ("model", "AI model name"),
     ("provider", "AI provider"),
     ("thinking", "thinking level (none/low/medium/high)"),
-    ("temperature", "sampling temperature (0.0–2.0)"),
+    (
+        "temperature",
+        "sampling temperature (0.0–1.0, or 0.0–2.0 where the provider documents it)",
+    ),
     ("max_tokens", "maximum response tokens"),
     ("max_turns", "maximum agent turns per prompt"),
     ("auto_watch", "auto-enable watch mode on start (true/false)"),
@@ -1445,9 +1181,16 @@ pub const SETTABLE_KEYS: &[(&str, &str)] = &[
     ("no_color", "disable colored output (true/false)"),
 ];
 
-/// Validate a config value for a given key. Returns `Ok(canonical_value)`
-/// on success or `Err(message)` on invalid input.
+/// Tests' shorthand: validate against `anthropic`, the run's default provider.
+#[cfg(test)]
 pub fn validate_config_value(key: &str, value: &str) -> Result<String, String> {
+    validate_config_value_for(key, value, "anthropic")
+}
+
+/// Validate a config value for a given key, for a session on `provider` (the
+/// temperature bound is per provider, #1207). Returns `Ok(canonical_value)`
+/// on success or `Err(message)` on invalid input.
+pub fn validate_config_value_for(key: &str, value: &str, provider: &str) -> Result<String, String> {
     match key {
         "model" | "provider" => {
             if value.is_empty() {
@@ -1468,8 +1211,13 @@ pub fn validate_config_value(key: &str, value: &str) -> Result<String, String> {
             }
         }
         "temperature" => match value.parse::<f32>() {
-            Ok(t) if (0.0..=2.0).contains(&t) => Ok(format!("{t}")),
-            Ok(t) => Err(format!("temperature {t} out of range (0.0–2.0)")),
+            // #1204/#1207: accept what the run sends unchanged, per provider.
+            Ok(t) if crate::cli::clamped_temperature(provider, t) == t => Ok(format!("{t}")),
+            Ok(t) => Err(format!(
+                "temperature {t} out of range ({}): yoyo sends at most {:.1}",
+                crate::temperature_support::temperature_range_label(provider),
+                crate::temperature_support::temperature_max_for_provider(provider)
+            )),
             Err(_) => Err(format!("'{value}' is not a valid number")),
         },
         "max_tokens" => match value.parse::<u32>() {
@@ -1678,7 +1426,8 @@ pub fn write_config_value_to(
     // Read existing content or start fresh
     let existing = crate::non_regular_read::read_for_rewrite(path)?;
 
-    let new_content = set_toml_key(&existing, key, value);
+    let new_content =
+        set_toml_key(&existing, key, value).map_err(|e| format!("{} {e}", path.display()))?;
 
     std::fs::write(path, &new_content)
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
@@ -1713,17 +1462,12 @@ pub fn append_allow_pattern_to(
 
     let existing = crate::non_regular_read::read_for_rewrite(path)?;
 
-    // Parse existing permissions to check for duplicates
-    let current = parse_permissions_from_config(&existing);
-    if current.allow.iter().any(|p| p == pattern) {
+    let new_content = set_permissions_allow(&existing, &[pattern.to_string()])
+        .map_err(|e| format!("{} {e}", path.display()))?;
+    if new_content == existing {
         // Already present — nothing to do
         return Ok(path.to_path_buf());
     }
-
-    // Build the new allow array
-    let mut new_allow = current.allow.clone();
-    new_allow.push(pattern.to_string());
-    let new_content = set_permissions_allow(&existing, &new_allow);
 
     std::fs::write(path, &new_content)
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
@@ -1731,182 +1475,10 @@ pub fn append_allow_pattern_to(
     Ok(path.to_path_buf())
 }
 
-/// Pure function: set the `[permissions]` `allow` array in TOML content.
-///
-/// If a `[permissions]` section with an `allow = [...]` line exists, it is
-/// replaced. If `[permissions]` exists but has no `allow`, the key is inserted
-/// right after the section header. If no `[permissions]` section exists, one
-/// is appended.
-fn set_permissions_allow(content: &str, patterns: &[String]) -> String {
-    let formatted: Vec<String> = patterns.iter().map(|p| format!("\"{}\"", p)).collect();
-    let allow_line = format!("allow = [{}]", formatted.join(", "));
+pub use config_toml_write::{set_permissions_allow, set_toml_key};
 
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-    let mut in_permissions = false;
-    let mut found_allow = false;
-    let mut permissions_section_exists = false;
-
-    for (i, line) in lines.iter_mut().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed == "[permissions]" {
-                permissions_section_exists = true;
-                in_permissions = true;
-            } else {
-                // If we were in [permissions] but never found allow, insert before this section
-                if in_permissions && !found_allow {
-                    // We'll handle insertion below
-                }
-                in_permissions = false;
-            }
-            continue;
-        }
-        if in_permissions && !found_allow {
-            if let Some((key, _)) = trimmed.split_once('=') {
-                if key.trim() == "allow" {
-                    *line = allow_line.clone();
-                    found_allow = true;
-                    let _ = i; // suppress unused warning
-                }
-            }
-        }
-    }
-
-    if permissions_section_exists && !found_allow {
-        // Insert allow line right after [permissions] header
-        let mut result = Vec::new();
-        for line in &lines {
-            result.push(line.clone());
-            if line.trim() == "[permissions]" {
-                result.push(allow_line.clone());
-            }
-        }
-        lines = result;
-    }
-
-    if !permissions_section_exists {
-        // Append a new [permissions] section
-        if !lines.is_empty() && !lines.last().unwrap().is_empty() {
-            lines.push(String::new());
-        }
-        lines.push("[permissions]".to_string());
-        lines.push(allow_line);
-    }
-
-    let mut result = lines.join("\n");
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result
-}
-
-/// Pure function: insert or replace `key = "value"` in a flat TOML string.
-/// Preserves comments, blank lines, and other keys. If the key already
-/// exists (matched by `^key\s*=`), replaces that line. Otherwise appends.
-///
-/// Values that look like numbers or booleans are written unquoted; everything
-/// else is quoted.
-pub fn set_toml_key(content: &str, key: &str, value: &str) -> String {
-    let formatted_value = format_toml_value(value);
-    let new_line = format!("{key} = {formatted_value}");
-
-    let mut found = false;
-    let mut lines: Vec<String> = content
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            // Match `key = ...` at the start of a non-comment line
-            if !trimmed.starts_with('#') {
-                if let Some((k, _)) = trimmed.split_once('=') {
-                    if k.trim() == key {
-                        found = true;
-                        return new_line.clone();
-                    }
-                }
-            }
-            line.to_string()
-        })
-        .collect();
-
-    if !found {
-        // Ensure there's a trailing newline before appending
-        if !lines.is_empty() {
-            let last = lines.last().unwrap();
-            if !last.is_empty() {
-                // Only add a blank line if the file doesn't already end with one
-            }
-        }
-        lines.push(new_line);
-    }
-
-    let mut result = lines.join("\n");
-    // Ensure file ends with a newline
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result
-}
-
-/// Format a value for TOML: numbers and booleans go unquoted,
-/// everything else gets double-quoted.
-pub(crate) fn format_toml_value(value: &str) -> String {
-    // Check if it's a number (integer or float)
-    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
-        return value.to_string();
-    }
-    // Check for booleans
-    if value == "true" || value == "false" {
-        return value.to_string();
-    }
-    // Default: quote it as a TOML basic string (#732 — unescaped values
-    // produced a config file the reader below could not parse back).
-    format!("\"{}\"", escape_toml_basic_string(value))
-}
-
-/// Escape a string for embedding in a TOML *basic* string (`"..."`).
-///
-/// Backslash first — escaping the quote first would then double the
-/// backslash the quote's escape just introduced.
-pub(crate) fn escape_toml_basic_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Inverse of [`escape_toml_basic_string`]. An unrecognised escape is kept
-/// verbatim (backslash included) rather than silently dropped.
-pub(crate) fn unescape_toml_basic_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('"') => out.push('"'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
+#[path = "config_toml_write.rs"]
+pub(crate) mod config_toml_write;
 
 // ---------------------------------------------------------------------------
 // Config-file path resolution and loading
@@ -2017,37 +1589,12 @@ pub fn history_file_path() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".yoyo_history"))
 }
 
-/// Parse a simple TOML-like config file (key = "value" or key = value per line).
-/// Ignores comments (#) and blank lines. Returns a map of key → value.
+/// The config file's top-level settings as a map of key → value (strings
+/// unquoted, other values as TOML text). See `top_level_scalars_from_table`.
 pub fn parse_config_file(content: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim().to_string();
-            let value = value.trim();
-            // Strip surrounding quotes if present. Basic strings ("..") get
-            // escape processing; TOML literal strings ('..') do not (#732).
-            // `chars()` not byte slicing — a multi-byte body would panic.
-            let value = if value.chars().count() >= 2 {
-                let mut inner = value.chars();
-                let first = inner.next().unwrap_or_default();
-                let last = inner.next_back().unwrap_or_default();
-                match (first, last) {
-                    ('"', '"') => unescape_toml_basic_string(inner.as_str()),
-                    ('\'', '\'') => inner.as_str().to_string(),
-                    _ => value.to_string(),
-                }
-            } else {
-                value.to_string()
-            };
-            map.insert(key, value);
-        }
-    }
-    map
+    // #1184: TOML's top-level keys, never a key from under a `[section]`.
+    // Content that is not TOML (the loader refuses it first) configures nothing.
+    config_toml_read::top_level_scalars_from_table(&config_toml_read::parse_table(content))
 }
 
 // ---------------------------------------------------------------------------
@@ -2160,6 +1707,78 @@ pub fn load_config_file() -> (HashMap<String, String>, String) {
     (HashMap::new(), String::new())
 }
 
+/// #1184 slice 1: the real TOML parser (the `toml` crate) is the gate for
+/// every config file yoyo loads. The readers below still hand-parse, so a file
+/// the parser rejects would otherwise run on whatever the hand parser guessed
+/// (`model = m1` ran as model `m1`; two `model =` lines silently took the
+/// last). Returns the located refusal for `content` (read from `shown`), or
+/// `None` when it is valid TOML. Pure, so every door and every test can ask.
+///
+/// The message names `path:line:column` (column counted in characters, as
+/// the parser counts it), the parser's own reason, the offending line with a
+/// caret, what happened, and what to do. Both the path and every echoed line
+/// go through `cli::sanitize_for_display`: the file is untrusted text.
+pub(crate) fn toml_parse_error(shown: &str, content: &str) -> Option<String> {
+    let err = content.parse::<toml::Table>().err()?;
+    let path = crate::cli::sanitize_for_display(shown);
+    let line_col = err.span().map(|span| line_col_at(content, span.start));
+    let (location, line_word) = match line_col {
+        Some((line, col)) => (
+            format!("{path}:{line}:{col}"),
+            format!("line {line} of {path}"),
+        ),
+        None => (path.clone(), path.clone()),
+    };
+    let reason = err.message().trim().to_string();
+    // The crate's Display is "TOML parse error at line L, column C", then a
+    // snippet with a caret, then the reason. Keep only the snippet: the
+    // location and the reason are already in our header line.
+    let rendered = err.to_string();
+    let snippet: Vec<String> = rendered
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty() && l.trim() != reason)
+        .map(crate::cli::sanitize_for_display)
+        .collect();
+    Some(format!(
+        "{location}: config file is not valid TOML: {}\n{}\n\
+         yoyo refuses to use it: values read from a file that is not TOML would be \
+         guesses, so nothing ran and nothing was sent.\n\
+         To fix: correct {line_word}, or move the file aside (yoyo then uses the next \
+         config file it finds, or its defaults).",
+        crate::cli::sanitize_for_display(&reason),
+        snippet.join("\n"),
+    ))
+}
+
+/// 1-based (line, column) of byte offset `at` in `text`, column in chars.
+/// `at` comes from the parser's span (a byte range), so it is clamped to a
+/// char boundary first instead of being trusted as one.
+fn line_col_at(text: &str, at: usize) -> (usize, usize) {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let before = &text[..at];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let col = before[line_start..].chars().count() + 1;
+    (line, col)
+}
+
+/// Print `toml_parse_error`'s refusal and exit
+/// [`crate::config_syntax::CONFIG_SYNTAX_REFUSAL_EXIT`] (2) if `content` is not
+/// TOML. Called by every `load_config_file` hit, so every door that loads the
+/// config (REPL, `-p`, piped, `doctor`, `permissions`, ...) refuses before any
+/// provider call. Not quiet-gated: this is a fault, not chatter.
+fn refuse_if_not_toml(shown: &str, content: &str) {
+    if let Some(msg) = toml_parse_error(shown, content) {
+        use crate::format::RED;
+        eprintln!("{RED}error:{RESET} {msg}");
+        crate::dispatch_sub::exit_process(crate::config_syntax::CONFIG_SYNTAX_REFUSAL_EXIT);
+    }
+}
+
 /// The shared tail of every `load_config_file` hit: announce, check syntax
 /// `parse_config_file` cannot report (#1034 warning; #1036 refusal at agent
 /// entry points), record provenance, parse.
@@ -2171,7 +1790,11 @@ fn accept_loaded_config(
     if !is_quiet() {
         eprintln!("{DIM}  config: {shown}{RESET}");
     }
+    refuse_if_not_toml(shown, &content); // #1184 slice 1: the real parser is the gate
     crate::config_syntax::check_loaded_config(shown, &content);
+    crate::config_unknown_keys::warn_unknown_config_keys_once(shown, &content); // #1171
+    crate::config_value::warn_unreadable_values_once(shown, &content); // #1177
+    crate::config_paths::warn_home_config_shadow_once(); // Day 253: two user-level files
     record_loaded_config_path(path);
     let map = parse_config_file(&content);
     record_sub_agent_model(&map);
@@ -2286,6 +1909,14 @@ pub fn loaded_config_is_project_local() -> bool {
     let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
     config_path_is_project_local(path, &cwd, home.as_deref())
 }
+
+#[cfg(test)]
+#[path = "config_toml_tests.rs"]
+mod config_toml_tests;
+
+#[cfg(test)]
+#[path = "config_toplevel_tests.rs"]
+mod config_toplevel_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2507,18 +2138,37 @@ env = { API_KEY = "secret" }
         );
     }
 
+    // The hand reader's `strip_quotes` / `parse_inline_table` were deleted
+    // with it (#1182); their tests now pin the same cases through the reader.
+    fn mcp_cmd(value: &str) -> Option<String> {
+        parse_mcp_servers_from_config(&format!("[mcp_servers.s]\ncommand = {value}\n"))
+            .pop()
+            .map(|s| s.command)
+    }
+
     #[test]
     fn test_config_module_strip_quotes() {
-        assert_eq!(strip_quotes("\"hello\""), "hello");
-        assert_eq!(strip_quotes("'hello'"), "hello");
-        assert_eq!(strip_quotes("hello"), "hello");
-        assert_eq!(strip_quotes("\"\""), "");
-        assert_eq!(strip_quotes(""), "");
+        assert_eq!(mcp_cmd("\"hello\"").as_deref(), Some("hello"));
+        assert_eq!(mcp_cmd("'hello'").as_deref(), Some("hello"));
+        // Unquoted is not TOML (the load gate refuses it), and an empty
+        // command is no server.
+        assert_eq!(mcp_cmd("hello"), None);
+        assert_eq!(mcp_cmd("\"\""), None);
+        assert_eq!(mcp_cmd(""), None);
+    }
+
+    fn mcp_env(value: &str) -> Vec<(String, String)> {
+        parse_mcp_servers_from_config(&format!(
+            "[mcp_servers.s]\ncommand = \"x\"\nenv = {value}\n"
+        ))
+        .pop()
+        .map(|s| s.env)
+        .unwrap_or_default()
     }
 
     #[test]
     fn test_config_module_parse_inline_table() {
-        let result = parse_inline_table(r#"{ KEY = "value", OTHER = "val2" }"#);
+        let result = mcp_env(r#"{ KEY = "value", OTHER = "val2" }"#);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], ("KEY".to_string(), "value".to_string()));
         assert_eq!(result[1], ("OTHER".to_string(), "val2".to_string()));
@@ -2526,11 +2176,9 @@ env = { API_KEY = "secret" }
 
     #[test]
     fn test_config_module_parse_inline_table_empty() {
-        let result = parse_inline_table("{}");
-        assert!(result.is_empty());
-
-        let result = parse_inline_table("not a table");
-        assert!(result.is_empty());
+        assert!(mcp_env("{}").is_empty());
+        // Not a table: the server is skipped, so no env either.
+        assert!(mcp_env("\"not a table\"").is_empty());
     }
 
     #[test]
@@ -2626,7 +2274,7 @@ env = { API_KEY = "secret" }
     #[test]
     fn test_set_toml_key_creates_new_key() {
         let content = "# yoyo config\nprovider = \"anthropic\"\n";
-        let result = set_toml_key(content, "model", "claude-sonnet-4-6");
+        let result = set_toml_key(content, "model", "claude-sonnet-4-6").unwrap();
         assert!(result.contains("model = \"claude-sonnet-4-6\""));
         // Original key should still be there
         assert!(result.contains("provider = \"anthropic\""));
@@ -2637,7 +2285,7 @@ env = { API_KEY = "secret" }
     #[test]
     fn test_set_toml_key_replaces_existing_key() {
         let content = "provider = \"anthropic\"\nmodel = \"old-model\"\n";
-        let result = set_toml_key(content, "model", "new-model");
+        let result = set_toml_key(content, "model", "new-model").unwrap();
         assert!(result.contains("model = \"new-model\""));
         assert!(!result.contains("old-model"));
         assert!(result.contains("provider = \"anthropic\""));
@@ -2646,7 +2294,7 @@ env = { API_KEY = "secret" }
     #[test]
     fn test_set_toml_key_preserves_comments() {
         let content = "# My config\n# model choice\nmodel = \"old\"\n# end\n";
-        let result = set_toml_key(content, "model", "new");
+        let result = set_toml_key(content, "model", "new").unwrap();
         assert!(result.contains("# My config"));
         assert!(result.contains("# model choice"));
         assert!(result.contains("# end"));
@@ -2655,20 +2303,20 @@ env = { API_KEY = "secret" }
 
     #[test]
     fn test_set_toml_key_numeric_value_unquoted() {
-        let result = set_toml_key("", "max_tokens", "8192");
+        let result = set_toml_key("", "max_tokens", "8192").unwrap();
         assert!(result.contains("max_tokens = 8192"));
         assert!(!result.contains("\"8192\""));
     }
 
     #[test]
     fn test_set_toml_key_string_value_quoted() {
-        let result = set_toml_key("", "model", "claude-opus-4-6");
+        let result = set_toml_key("", "model", "claude-opus-4-6").unwrap();
         assert!(result.contains("model = \"claude-opus-4-6\""));
     }
 
     #[test]
     fn test_set_toml_key_empty_content() {
-        let result = set_toml_key("", "provider", "anthropic");
+        let result = set_toml_key("", "provider", "anthropic").unwrap();
         assert!(result.contains("provider = \"anthropic\""));
         assert!(result.ends_with('\n'));
     }
@@ -2693,6 +2341,46 @@ env = { API_KEY = "secret" }
         assert!(validate_config_value("max_tokens", "0").is_err());
         assert!(validate_config_value("max_tokens", "-1").is_err());
         assert!(validate_config_value("unknown_key", "val").is_err());
+    }
+
+    /// #1204: `config set temperature` accepts exactly what the run sends,
+    /// i.e. the values `cli::clamped_temperature` leaves unchanged.
+    #[test]
+    fn temperature_set_range_is_the_range_the_run_sends() {
+        for v in ["0", "0.0", "0.7", "1", "1.0"] {
+            let t: f32 = v.parse().unwrap();
+            assert!(validate_config_value("temperature", v).is_ok(), "{v}");
+            assert_eq!(crate::cli::clamped_temperature("anthropic", t), t, "{v}");
+        }
+        for v in ["1.0001", "1.5", "2.0", "-0.1", "NaN", "inf", "abc"] {
+            assert!(validate_config_value("temperature", v).is_err(), "{v}");
+        }
+        let err = validate_config_value("temperature", "1.5").unwrap_err();
+        assert!(
+            err.contains("0.0–1.0 for anthropic") && err.contains("at most 1.0"),
+            "{err}"
+        );
+    }
+
+    /// #1207: on a provider documenting 0–2, `/config set` accepts up to 2.0,
+    /// still exactly what the run sends there.
+    #[test]
+    fn temperature_set_range_follows_the_provider() {
+        for v in ["1.5", "2", "2.0"] {
+            assert!(
+                validate_config_value_for("temperature", v, "openai").is_ok(),
+                "{v}"
+            );
+            assert!(
+                validate_config_value_for("temperature", v, "anthropic").is_err(),
+                "{v}"
+            );
+        }
+        let err = validate_config_value_for("temperature", "2.5", "openai").unwrap_err();
+        assert!(
+            err.contains("0.0–2.0 for openai") && err.contains("at most 2.0"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2765,29 +2453,35 @@ env = { API_KEY = "secret" }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// What `/config set k <value>` writes after `k = ` (#1184: toml_edit
+    /// chooses the string form, so these pin its choice and the round trip).
+    fn written(value: &str) -> String {
+        let out = set_toml_key("", "k", value).unwrap();
+        out.strip_prefix("k = ").unwrap().trim_end().to_string()
+    }
+
     #[test]
-    fn test_format_toml_value() {
-        assert_eq!(format_toml_value("hello"), "\"hello\"");
-        assert_eq!(format_toml_value("42"), "42");
-        assert_eq!(format_toml_value("3.14"), "3.14");
-        assert_eq!(format_toml_value("true"), "true");
-        assert_eq!(format_toml_value("false"), "false");
-        assert_eq!(
-            format_toml_value("claude-sonnet-4-6"),
-            "\"claude-sonnet-4-6\""
-        );
+    fn test_written() {
+        assert_eq!(written("hello"), "\"hello\"");
+        assert_eq!(written("42"), "42");
+        assert_eq!(written("3.14"), "3.14");
+        assert_eq!(written("true"), "true");
+        assert_eq!(written("false"), "false");
+        assert_eq!(written("claude-sonnet-4-6"), "\"claude-sonnet-4-6\"");
     }
 
     #[test]
     fn test_format_toml_value_escapes_specials() {
         // #732: unescaped values produced a file parse_config_file could not read.
-        assert_eq!(format_toml_value("say \"hi\""), r#""say \"hi\"""#);
-        assert_eq!(format_toml_value(r"C:\tmp"), r#""C:\\tmp""#);
-        assert_eq!(format_toml_value("a\nb"), r#""a\nb""#);
-        assert_eq!(format_toml_value("a\tb\rc"), r#""a\tb\rc""#);
-        // Backslash must be escaped BEFORE the quote, or the quote's own
-        // backslash gets doubled. This asserts the ordering bug can't return.
-        assert_eq!(format_toml_value(r#"a\"b"#), r#""a\\\"b""#);
+        // Since #1184 toml_edit picks the string form: a literal '...' when
+        // the value has a quote or backslash and no control character, a
+        // multi-line """ for a newline, escapes for other control characters.
+        // The round-trip test below is the promise; these pin the forms.
+        assert_eq!(written("say \"hi\""), r#"'say "hi"'"#);
+        assert_eq!(written(r"C:\tmp"), r"'C:\tmp'");
+        assert_eq!(written("a\nb"), "\"\"\"\na\nb\"\"\"");
+        assert_eq!(written("a\tb\rc"), r#""a\tb\rc""#);
+        assert_eq!(written(r#"a\"b"#), r#"'a\"b'"#);
     }
 
     #[test]
@@ -2806,7 +2500,7 @@ env = { API_KEY = "secret" }
             "→ unicode ✓",
             "",
         ] {
-            let line = format!("k = {}", format_toml_value(original));
+            let line = set_toml_key("", "k", original).unwrap();
             let parsed = parse_config_file(&line);
             assert_eq!(
                 parsed.get("k").map(String::as_str),
@@ -2825,9 +2519,15 @@ env = { API_KEY = "secret" }
 
     #[test]
     fn test_parse_config_file_lone_quote_does_not_panic() {
-        // `value[1..value.len() - 1]` panicked on a one-char value.
+        // `value[1..value.len() - 1]` panicked on a one-char value. Since
+        // #1177 an unterminated string is refused (left out, warned about at
+        // load) rather than read as the quote character itself.
         let parsed = parse_config_file("k = \"");
-        assert_eq!(parsed.get("k").map(String::as_str), Some("\""));
+        assert_eq!(parsed.get("k"), None);
+        assert_eq!(
+            crate::config_value::read_scalar("\""),
+            Err("an unterminated string")
+        );
     }
 
     #[test]
@@ -3694,8 +3394,11 @@ thinking = "high"
 
     #[test]
     fn test_parse_config_file_no_quotes() {
+        // A bare string is not TOML: the loader refuses the file (#1184 slice
+        // 1) and the map, built by the toml crate since slice 2, holds nothing.
         let content = "model = claude-haiku-35\nmax_tokens = 2048";
-        let config = parse_config_file(content);
+        assert!(parse_config_file(content).is_empty());
+        let config = parse_config_file("model = \"claude-haiku-35\"\nmax_tokens = 2048");
         assert_eq!(config.get("model").unwrap(), "claude-haiku-35");
         assert_eq!(config.get("max_tokens").unwrap(), "2048");
     }
@@ -3715,7 +3418,7 @@ thinking = "high"
 
     #[test]
     fn test_parse_config_file_whitespace_handling() {
-        let content = "  model  =  claude-opus-4-6  ";
+        let content = "  model  =  \"claude-opus-4-6\"  ";
         let config = parse_config_file(content);
         assert_eq!(config.get("model").unwrap(), "claude-opus-4-6");
     }
@@ -3889,7 +3592,7 @@ mcp = ["npx open-websearch@latest", "npx @mcp/server-filesystem /tmp"]
     #[test]
     fn test_set_permissions_allow_creates_section() {
         let content = "model = \"claude-sonnet-4-6\"\n";
-        let result = set_permissions_allow(content, &["cargo test*".to_string()]);
+        let result = set_permissions_allow(content, &["cargo test*".to_string()]).unwrap();
         assert!(result.contains("[permissions]"));
         assert!(result.contains("allow = [\"cargo test*\"]"));
         // Original content preserved
@@ -3902,7 +3605,8 @@ mcp = ["npx open-websearch@latest", "npx @mcp/server-filesystem /tmp"]
         let result = set_permissions_allow(
             content,
             &["cargo build*".to_string(), "cargo test*".to_string()],
-        );
+        )
+        .unwrap();
         assert!(result.contains("allow = [\"cargo build*\", \"cargo test*\"]"));
         // Deny is preserved
         assert!(result.contains("deny = [\"rm*\"]"));
@@ -3911,7 +3615,7 @@ mcp = ["npx open-websearch@latest", "npx @mcp/server-filesystem /tmp"]
     #[test]
     fn test_set_permissions_allow_inserts_if_section_exists_without_allow() {
         let content = "[permissions]\ndeny = [\"rm*\"]\n";
-        let result = set_permissions_allow(content, &["cargo test*".to_string()]);
+        let result = set_permissions_allow(content, &["cargo test*".to_string()]).unwrap();
         assert!(result.contains("allow = [\"cargo test*\"]"));
         assert!(result.contains("deny = [\"rm*\"]"));
     }

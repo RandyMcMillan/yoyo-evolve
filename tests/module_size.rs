@@ -204,7 +204,7 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // Day 249 (#1122): +4, the openrouter arm's second lookup (yoagent routed presets).
     // Day 250 (#1026): +3, `incomplete: None` in three existing PromptOutcome test literals.
     // Day 251 (#1145): 4984 -> 4980, temperature wiring moved to src/temperature_support.rs.
-    ("src/agent_builder.rs", 4977), // Day 251: #1144 — anthropic_output_maximum reads yoagent 0.27.2 max_output first.
+    ("src/agent_builder.rs", 5026), // Day 260: #1203 — /side and /architect set agent.max_tokens via thinking_off_max_tokens (the main agent's thinking-off rule; test in agent_limits_tests.rs): 5012 -> 5026. Day 260: #1173 — the bedrock arm sets agent.max_tokens from providers::bedrock_max_tokens (helper and its agreement test live in providers.rs): 5009 -> 5012. Day 256: #1176 — unknown-provider warning once per (provider, url) via WARNED_UNKNOWN_PROVIDERS: 4997 -> 5009. Day 254: #1168 — google_limits_beyond_preset and its run-path/ceiling readers deleted (yoagent 0.27.7 presets cover every Gemini id): 5011 -> 4997; the register had been 34 behind HEAD inside the grace band. Day 251: #1144 — anthropic_output_maximum reads yoagent 0.27.2 max_output first.
     // Day 164 (#728): +98 lines — `/skill install`'s destination becomes a third
     // auto-discovery source, so an explicitly installed skill actually loads.
     // The two near-identical per-directory blocks were collapsed into one loop
@@ -291,7 +291,7 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // source-level guard pinning that. Acknowledged, not absorbed.
     // Day 247 (#1108): 3542 -> 3576. +4 is /cost's per-turn sub-agent block call
     // site; the other +30 was absorbed drift, recorded here rather than left.
-    ("src/commands_info.rs", 3558), // Day 251: #1144 — the Claude branch of the hand window table is gone (Claude ids read yoagent); tests in anthropic_preset_tests.rs.
+    ("src/commands_info.rs", 3559), // Day 254: #1168 — the /model info GOOGLE_PUBLISHED_LIMITS branch is gone (-4, 3563 -> 3559; the register had been 10 behind HEAD inside the grace band). Day 253: #1118 — the gemini-2.0 window branch is gone (shut down per Google) and the 3.x/2.5 branches merged (-5). Day 251: #1144 — the Claude branch of the hand window table is gone (Claude ids read yoagent); tests in anthropic_preset_tests.rs.
     // Day 163 (#726): -59 lines — emerging-risk prompt injection removed
     // (map, annotation, helper, and the test pinning them); see #724.
     // Day 174: +3 absorbed since Day 166.
@@ -302,11 +302,13 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // REGISTERED RATHER THAN SPLIT on the `src/prompt_retry.rs` precedent: a
     // register edit cannot half-land, a pure move can, and a half-landed move
     // is a reverted session. The split is owed, not done.
-    ("src/commands.rs", 2164),
+    ("src/commands.rs", 2174), // Day 253: #1118 — /model completion gains gemini-3.6-flash and gemini-3.1-pro-preview (+2); the other +8 was drift already inside the grace band.
     // Day 211 (#962): 3640 -> 3645 (+5): `handle_init_in(dir)` seam.
     // Day 228 (#869): /cd deny wired into auto_context; 3653 -> 3709 (+56: pure
     // select_auto_context_paths extracted + its emission-point test).
-    ("src/commands_project.rs", 3709),
+    // Day 252 (#1127): 3709 -> 3790; +10 is docs_usage(surface) so `yoyo docs`
+    // says `yoyo docs`, the other +71 was drift already present at HEAD (3780).
+    ("src/commands_project.rs", 3790),
     // Day 162 (#708): +40 lines — classify_broke_files now filters to `src/`
     // (the risk model's whole universe), plus its unit test and the updated
     // end-to-end fixture assertions.
@@ -345,7 +347,12 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // Day 250: #1137 — `risk snapshot` / `validate` / `harvest` exit 1 on a
     // runtime failure: the RISK_FAILED flag (+6) plus one store per failure
     // arm (+7); the other +1 was drift already present at HEAD (6602). Pasted.
-    ("src/commands_risk.rs", 6615),
+    // Day 252 (#1127): +9, unknown_risk_subcommand_line(surface) + its import.
+    // Day 253 (#1155): +21, risk_snapshot_form + no_snapshots_line(surface, sub)
+    // and the surface threaded into history/validate/accuracy/harvest/learning.
+    ("src/commands_risk.rs", 6645),
+    // Day 253: pasted from what the gate printed; unlisted at 2036, 14 lines from FATAL.
+    ("src/commands_risk_unhittable.rs", 2036),
     // Day 162 (#707): +68 lines — format_project_index no longer byte-slices a
     // path tail (live panic on any non-ASCII path >50 bytes) and measures its
     // column in chars; 62 of the 68 lines are the two regression tests, one of
@@ -372,7 +379,10 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // their tests incl. the list-vs-parser pin), pasted.
     // Day 249 (#1133): 4755 -> 4778 (+23): parse_grep_tokens / handle_grep_args_status /
     // handle_outline_split_status let the shell door hand argv in without a re-split, pasted.
-    ("src/commands_search.rs", 4778),
+    // Day 260 (#1201): re-recorded at 4784. HEAD was already 4780 (2 over); the
+    // `-e <pattern> --` fix is net 0 production lines (three 2-line pushes
+    // became three 2-line pushes), +4 is the commands_search_grep_rev_tests mod.
+    ("src/commands_search.rs", 4784),
     // Day 163 (#716): +99 lines — spawn_dir_restrictions confines a spawn
     // worker's file tools to its worktree (bash_cwd only pinned bash), plus
     // three regression tests covering no-worktree passthrough, the confined
@@ -398,7 +408,7 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // Day 236 (#1014): 4576 -> 4570. The write tap's ~8 wiring lines were paid
     // for by deleting the duplicate run_git_in/repo_root (spawn_worktree.rs's
     // copies are now pub(crate)); the tap itself lives in src/spawn_write_tap.rs.
-    ("src/commands_spawn.rs", 4570),
+    ("src/commands_spawn.rs", 4629),
     // Day 162 (#692): +108 lines — extract_last_assistant_text now stops at the
     // newest turn's boundary (no stale-turn fallback) plus the regression tests
     // pinning that a text-less newest turn yields None, not an older turn's text.
@@ -412,7 +422,7 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // Day 229 (#869): 4640 -> 4742. ~97 was already in the drift band; this
     // task's +5 is `check` reading the /cd-suspended allow list in the
     // authority (pure `check_with_suspended` beside it); the rest is in cd_allow.rs.
-    ("src/config.rs", 4762), // Day 230: +20 for `LOADED_CONFIG_RESOLVED` (the loaded config resolved at load time, so `/cd` back home can recognise it, #1032). Day 205: +190 for the `sub_agent_model` knob — parse, the load-time store and `effective_sub_agent_model`, plus the parse/resolution tables that pin absent-is-the-parent-verbatim.
+    ("src/config.rs", 4548), // Day 264: #1184 step 2 — set_toml_key / set_permissions_allow / format_toml_value / escape_toml_basic_string moved to toml_edit in config_toml_write.rs (-152 from 4700). Day 262: #1184 — parse_permissions_from_config / parse_directories_from_config read the parsed toml::Table (config_toml_read::fence_list) instead of walking lines (-39 from 4739; the +43 above 4696 was drift already inside the grace band). Day 259: #1182 — the mcp_servers/model_pricing hand readers, strip_quotes and parse_inline_table moved out to the toml crate via config_toml_read.rs (-155, ratcheted down). Day 256: #1174 — the five section-header readers call config_unknown_keys::toml_section_header, so `[x] # comment` is a header (-2; reader and tests live in config_unknown_keys.rs). Day 255: #1171 — +1 for the unknown-key warning call site (logic and tests in config_unknown_keys.rs); the other +90 was drift already inside the grace band. Day 230: +20 for `LOADED_CONFIG_RESOLVED` (the loaded config resolved at load time, so `/cd` back home can recognise it, #1032). Day 205: +190 for the `sub_agent_model` knob — parse, the load-time store and `effective_sub_agent_model`, plus the parse/resolution tables that pin absent-is-the-parent-verbatim.
     // Day 165: 2307 -> 2296. Not a shrink I made this session — the entry was
     // stale-high, and branch 3 (below-ceiling is fatal) is what finally said so.
     // Day 184: 2321 -> 2337 (+16). NOT this task's diff — `git diff src/dispatch.rs`
@@ -478,7 +488,9 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // status functions so usage names `yoyo <verb>`; rustfmt wrapped each call (+4) and the
     // blame dispatch test's assert (+3), pasted.
     // Day 252: #1114 flag_value skips value slots via option_position, +7 (doc lines).
-    ("src/dispatch_sub.rs", 2677),
+    // Day 253 (#1154): 2680 at HEAD (+3 unregistered drift), +3 for the Shell
+    // surface passed to config get (rustfmt wraps the call).
+    ("src/dispatch_sub.rs", 2683),
     // Day 209: 3439 -> 3455 (+16, within the drift band, pasted rather than left to absorb).
     // #937 option 1: nine lines of doc above `builtin_model_pricing` naming both ignored
     // audit commands (deliverable 4 — an alarm nobody can find is the #745/#767/#769
@@ -564,8 +576,11 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // than smuggled: this file is now grandfathered, so branch 2/3's ±100 drift
     // band applies to it from here on. The better fix is a split; owed, not done.
     // Day 237 (#1072): 2031 -> 2032, the `#[path]` line declaring git_branch.rs; context.rs shrank by 3.
-    ("src/git.rs", 2032),
-    ("src/help.rs", 2856), // Day 196: +71 drift paid off (pasted from what the gate printed).
+    // Day 254 (#1169): 2032 -> 2037, `git_stdout` (one trim_end decoder shared by
+    // run_git/run_git_in_dir, net +2) and the 3-line `#[path]` wiring of git_porcelain_tests.rs.
+    ("src/git.rs", 2037),
+    // Day 258 (#1190): 2856 -> 2946, drift paid off; the #1190 fix itself is a line swap (+0).
+    ("src/help.rs", 2946), // Day 196: +71 drift paid off (pasted from what the gate printed).
     // Day 197: the stdin channel (`hook_stdin_payload` + its guards) crossed the
     // cap. Registered rather than split, on the Day-183 `prompt_retry.rs`
     // precedent: registering is this gate's OWN stated remedy, while the better
@@ -626,7 +641,9 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // Day 251 (#1026 item 1): 3977 -> 3987 (+10, 3 earlier unregistered drift), the
     // stream-json AgentEnd arm now prints the cut/refusal note on stderr; the
     // printer and the json field builder live in src/prompt/output_limit.rs.
-    ("src/prompt.rs", 3987),
+    // +1 Day 261 (#1206): `mod refusal_history;`; the three `agent.finish()` joins
+    // became `finish_and_scrub` in place, the logic lives in that module.
+    ("src/prompt.rs", 3988),
     // Day 183: first entry for this file — 2042, i.e. 42 past MAX_MODULE_LINES and
     // so inside OVERSHOOT_GRACE_LINES, which is why it warned instead of failing.
     // Registering it is this gate's OWN stated remedy for a grace-band overshoot
@@ -650,14 +667,14 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // Day 241 (20:26): 2785 -> 2786 -- +1 for REFUSAL_STEM_PARTIAL_READ in is_deterministic_tool_error.
     // +1 Day 248 (#1120): the reserved-DNS fast-fail pointer beside the classifier.
     // +6 Day 249 (#1126): DNS matcher takes reqwest's real text; tests in a sibling file.
-    ("src/prompt_retry.rs", 2793), // Day 252 (01:37): +1, yoagent ReadLog refusal stem is deterministic (#1094).
+    ("src/prompt_retry.rs", 2800), // Day 255 (00:19): -4, is_overflow_error delegates to yoagent; OVERFLOW_PHRASES hand copy deleted (#1167); before: Day 254 (13:34): +1, xAI 400 "Incorrect API key provided" is an auth failure (#1165); before: +10 at 12:00 for Google 400 API_KEY_INVALID (#1163).
     // Day 162 (#689): +14 lines — double Ctrl+C at the idle REPL prompt now
     // exits (consecutive-flag `ctrl_c_armed`, dim hint on first press).
     // Day 174: +91 absorbed since Day 166.
     // Day 251 (#1145): 3358 -> 3388 -- +20 earlier unregistered drift, +10 for the
     // banner saying "(not sent)" when the model rejects temperature (logic in
     // src/temperature_support.rs).
-    ("src/repl.rs", 3388),
+    ("src/repl.rs", 3411), // Day 255 (00:19): +23 (from 3388; HEAD was already 3391), a checkpoint stop blocks auto-continue: helper, skip note, per-turn reset (#1161).
     // Day 174: raised 3269 -> 3490 for `git_redirection_refusal_message` +
     // `classify_redirection_reason` (~76 lines) and their emission-point tests
     // (~146) — the worktree-confinement refusal now names the accepted
@@ -665,7 +682,7 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // would also be refused. The message belongs beside the detector whose
     // reason string it classifies; splitting them would create the second
     // matcher this deliberately avoids.
-    ("src/safety.rs", 4714),
+    ("src/safety.rs", 4816), // Day 262 (23:24): +2 (from 4814), #1196: a lone echo/printf (bash_parse::lone_print_command) has the raw-text pass read it quote-stripped, so its quoted text is a mention and only $(...) bodies are checked. Before: Day 262 (00:01): -4 (from 4818), #1205: the tree pass moved into bash_parse::tree_refusal (one call), which also re-spells each unit as the argv bash runs. Before: Day 260 (20:52): +9 (from 4809), #1202 step 1: analyze_bash_command also runs SAFETY_CHECKS on every command/pipeline/redirect node of the tree-sitter-bash parse (src/bash_parse.rs); the parser lives outside this file. Before: Day 259 (20:29): +10 (from 4799), #1193: analyze_bash_command re-runs SAFETY_CHECKS on each piece split at $( ( ) backtick (SUBSHELL_BREAKS, a slice of SEGMENT_BREAKS); census and near-misses in safety_git_glued_tests.rs. Before: Day 259 (02:03) +10 from 4789 for #1191.
     // Day 175 (#816): first entry for this file — 1882 → 2067, +185. The setup
     // wizard becomes the second and third consumer of the #735 shadow/demotion
     // guard family (which had exactly one: `/config set`), so both of its save
@@ -737,7 +754,7 @@ const GRANDFATHERED_OVERSIZED_MODULES: &[(&str, usize)] = &[
     // pin the two child sets, the refusal stem, the parent-facing description
     // and the fold. Number pasted from what the gate itself printed (line
     // count after `cargo fmt`; the gate ran on 4655 pre-fmt).
-    ("src/tools.rs", 5295), // Day 252 (01:37): 5247 -> 5295 (+48, of which +27 is this task; HEAD had drifted 5247 -> 5268 inside the grace band) — one yoagent `ReadLog` per agent shared by its read_file/write_file (parent and sub-agent child stacks), plus `READ_LOG_REFUSAL_STEM` so that refusal is not auto-retried (#1094 items 3, 4); tests live in src/tools_read_log_tests.rs. Day 235 (14:52): 5207 -> 5247 (+40, of which +5 is this task; HEAD had drifted 5207 -> 5242 inside the grace band) — `StreamingBashTool::scrub_vars` and its call site, the opt-in YOYO_SUBPROCESS_ENV_SCRUB credential scrub (#1064); logic and tests live in src/subprocess_env.rs. Day 223 (20:34): 5128 -> 5207 (+79, of which +5 is the null stdin paired with the process group, as yoagent 0.25.2 does, so a tty reader is not SIGTTIN-frozen; HEAD had already drifted 5053 -> 5128 inside the grace band) — `GroupKill` and the process-group spawn so a bash timeout/cancel kills pipeline stages and background jobs, not just `bash` (yoagent#277 twin); its tests live in src/tools_group_kill_tests.rs. Day 217 (14:33): 5068 -> 5053 — the hard deny list and its predicate moved to src/hard_deny.rs (token matcher, its tests live there); tools.rs re-exports them. Day 217 (#977): 5033 -> 5068 — `HARD_DENY_PATTERNS` authority, `hard_deny_refusal`, `child_confirm_refusal`, and the child bash wrapper now always applied; tests live in src/tools_child_bash_tests.rs. Day 216 (Task 1): 4975 -> 5033 — `UserDenyBashTool` + the shared `user_deny_refusal` predicate, so sub-agent/explore-agent child bash honours user deny. Day 215 (Task 2): 4940 -> 4975 (+35) — `StreamingBashTool::user_deny` plus `build_bash_tool`, so a user deny pattern blocks bash under --yes and after "always"; its tests live in src/tools_user_deny_tests.rs. Day 210 (Task 2): 4931 -> 4940 (+9) — the outermost `SubAgentOutputMarkerTool` wrap at `dispatch_tool_with_fallback`, plus the import; the marker must be applied at the seam both dispatch doors leave through, not inside a decorator only one of them reaches. Day 205: +32 for the single child-model resolution that both dispatch doors read, and the label that must name it.
+    ("src/tools.rs", 5286), // Day 254 (01:44, #1159 item 1): 5295 -> 5286 -- the head-only cap and the write-only `truncated` flag left; the head+tail accumulator and its tests live in src/bash_output_cap.rs. Day 252 (01:37): 5247 -> 5295 (+48, of which +27 is this task; HEAD had drifted 5247 -> 5268 inside the grace band) — one yoagent `ReadLog` per agent shared by its read_file/write_file (parent and sub-agent child stacks), plus `READ_LOG_REFUSAL_STEM` so that refusal is not auto-retried (#1094 items 3, 4); tests live in src/tools_read_log_tests.rs. Day 235 (14:52): 5207 -> 5247 (+40, of which +5 is this task; HEAD had drifted 5207 -> 5242 inside the grace band) — `StreamingBashTool::scrub_vars` and its call site, the opt-in YOYO_SUBPROCESS_ENV_SCRUB credential scrub (#1064); logic and tests live in src/subprocess_env.rs. Day 223 (20:34): 5128 -> 5207 (+79, of which +5 is the null stdin paired with the process group, as yoagent 0.25.2 does, so a tty reader is not SIGTTIN-frozen; HEAD had already drifted 5053 -> 5128 inside the grace band) — `GroupKill` and the process-group spawn so a bash timeout/cancel kills pipeline stages and background jobs, not just `bash` (yoagent#277 twin); its tests live in src/tools_group_kill_tests.rs. Day 217 (14:33): 5068 -> 5053 — the hard deny list and its predicate moved to src/hard_deny.rs (token matcher, its tests live there); tools.rs re-exports them. Day 217 (#977): 5033 -> 5068 — `HARD_DENY_PATTERNS` authority, `hard_deny_refusal`, `child_confirm_refusal`, and the child bash wrapper now always applied; tests live in src/tools_child_bash_tests.rs. Day 216 (Task 1): 4975 -> 5033 — `UserDenyBashTool` + the shared `user_deny_refusal` predicate, so sub-agent/explore-agent child bash honours user deny. Day 215 (Task 2): 4940 -> 4975 (+35) — `StreamingBashTool::user_deny` plus `build_bash_tool`, so a user deny pattern blocks bash under --yes and after "always"; its tests live in src/tools_user_deny_tests.rs. Day 210 (Task 2): 4931 -> 4940 (+9) — the outermost `SubAgentOutputMarkerTool` wrap at `dispatch_tool_with_fallback`, plus the import; the marker must be applied at the seam both dispatch doors leave through, not inside a decorator only one of them reaches. Day 205: +32 for the single child-model resolution that both dispatch doors read, and the label that must name it.
     // Day 163 (#726): -58 lines — emerging-risk annotation removed from
     // build_watch_fix_prompt, with its own test; see #724.
     ("src/watch.rs", 4418),

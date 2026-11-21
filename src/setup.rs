@@ -26,10 +26,6 @@ pub const WIZARD_PROVIDERS: &[(&str, &str)] = &[
         "bedrock",
         "AWS Bedrock (Claude, Nova — uses AWS credentials)",
     ),
-    (
-        "github",
-        "GitHub Models (GPT-4o, Claude, Llama — uses GITHUB_TOKEN)",
-    ),
     ("custom", "Custom (self-hosted OpenAI-compatible)"),
 ];
 
@@ -69,7 +65,7 @@ pub fn key_not_saved_notice(provider: &str, config_path: Option<&str>) -> String
         out.push_str("  export AWS_ACCESS_KEY_ID=\"…\"\n");
         out.push_str("  export AWS_SECRET_ACCESS_KEY=\"…\"\n");
     } else {
-        let env_var = provider_api_key_env(provider).unwrap_or("ANTHROPIC_API_KEY");
+        let env_var = provider_api_key_env(provider).unwrap_or("API_KEY");
         out.push_str(&format!("  export {env_var}=\"…\"\n"));
     }
     match config_path {
@@ -496,7 +492,7 @@ pub fn run_wizard_interactive_in<R: BufRead, W: Write>(
 
         (combined_key, Some(bedrock_url))
     } else {
-        let env_var = provider_api_key_env(provider).unwrap_or("ANTHROPIC_API_KEY");
+        let env_var = provider_api_key_env(provider).unwrap_or("API_KEY");
         writeln!(writer).ok();
         writeln!(writer, "  {BOLD}Step 2:{RESET} Enter your API key").ok();
         writeln!(
@@ -855,14 +851,20 @@ fn api_key_in_config_files() -> bool {
 
 /// Is an API key reachable from the environment for this provider?
 fn api_key_in_env(provider: &str) -> bool {
-    let is_set = |var: &str| std::env::var(var).ok().filter(|k| !k.is_empty()).is_some();
+    api_key_in_env_with(provider, |v| std::env::var(v).ok())
+}
+
+/// `api_key_in_env` over an injected lookup, so tests never touch the process env.
+fn api_key_in_env_with(provider: &str, get: impl Fn(&str) -> Option<String>) -> bool {
+    let is_set = |var: &str| get(var).filter(|k| !k.is_empty()).is_some();
     if let Some(env_var) = provider_api_key_env(provider) {
         if is_set(env_var) {
             return true;
         }
     }
-    // Generic fallbacks, matching cli.rs's key resolution chain.
-    is_set("ANTHROPIC_API_KEY") || is_set("API_KEY")
+    // The generic fallback, matching cli.rs's key resolution chain. Not
+    // ANTHROPIC_API_KEY: only anthropic reads it, as its own variable (#1170).
+    is_set("API_KEY")
 }
 
 /// Check whether we should offer the setup wizard.
@@ -937,8 +939,7 @@ mod tests {
         assert_eq!(parse_provider_choice("10"), Some("cerebras"));
         assert_eq!(parse_provider_choice("11"), Some("minimax"));
         assert_eq!(parse_provider_choice("12"), Some("bedrock"));
-        assert_eq!(parse_provider_choice("13"), Some("github"));
-        assert_eq!(parse_provider_choice("14"), Some("custom"));
+        assert_eq!(parse_provider_choice("13"), Some("custom"));
     }
 
     #[test]
@@ -953,8 +954,6 @@ mod tests {
         assert_eq!(parse_provider_choice("MiniMax"), Some("minimax"));
         assert_eq!(parse_provider_choice("bedrock"), Some("bedrock"));
         assert_eq!(parse_provider_choice("Bedrock"), Some("bedrock"));
-        assert_eq!(parse_provider_choice("github"), Some("github"));
-        assert_eq!(parse_provider_choice("GitHub"), Some("github"));
         assert_eq!(parse_provider_choice("custom"), Some("custom"));
         assert_eq!(parse_provider_choice("CUSTOM"), Some("custom"));
     }
@@ -965,6 +964,16 @@ mod tests {
         assert_eq!(parse_provider_choice("99"), None);
         assert_eq!(parse_provider_choice("banana"), None);
         assert_eq!(parse_provider_choice(""), None);
+    }
+
+    #[test]
+    fn wizard_does_not_offer_retired_github_models() {
+        // #1166: GitHub Models was retired on 2026-07-30, so the wizard no longer
+        // offers it, by name or by number (13 is now Custom; 14 is past the end).
+        assert!(WIZARD_PROVIDERS.iter().all(|&(slug, _)| slug != "github"));
+        assert_eq!(parse_provider_choice("github"), None);
+        assert_eq!(parse_provider_choice("GitHub"), None);
+        assert_eq!(parse_provider_choice("14"), None);
     }
 
     #[test]
@@ -1373,8 +1382,8 @@ mod tests {
 
     #[test]
     fn test_wizard_custom_provider_flow() {
-        // Choose custom (14), enter API key, enter base URL, accept default model, save=no
-        let input = "14\nmy-custom-key\nhttp://localhost:8080/v1\n\nn\n";
+        // Choose custom (13), enter API key, enter base URL, accept default model, save=no
+        let input = "13\nmy-custom-key\nhttp://localhost:8080/v1\n\nn\n";
         let mut reader = io::Cursor::new(input.as_bytes());
         let mut output = Vec::new();
 
@@ -1392,8 +1401,8 @@ mod tests {
 
     #[test]
     fn test_wizard_custom_provider_no_base_url_returns_none() {
-        // Choose custom (14), enter API key, enter empty base URL
-        let input = "14\nmy-custom-key\n\n";
+        // Choose custom (13), enter API key, enter empty base URL
+        let input = "13\nmy-custom-key\n\n";
         let mut reader = io::Cursor::new(input.as_bytes());
         let mut output = Vec::new();
 
@@ -2050,5 +2059,26 @@ must be named: {output_str}"
             output_str.contains(&xdg_config.display().to_string()),
             "the warning must name the config that just went dark: {output_str}"
         );
+    }
+
+    /// #1170: ANTHROPIC_API_KEY counts as "a key is reachable" only for
+    /// anthropic. For any other provider cli.rs no longer reads it, so treating
+    /// it as present would skip the wizard and start with no key.
+    #[test]
+    fn anthropic_key_counts_only_for_anthropic() {
+        let only_anthropic = |v: &str| (v == "ANTHROPIC_API_KEY").then(|| "sk-ant".to_string());
+        assert!(api_key_in_env_with("anthropic", only_anthropic));
+        for provider in ["openai", "openrouter", "xai", "bedrock", "google"] {
+            assert!(
+                !api_key_in_env_with(provider, only_anthropic),
+                "{provider} counted ANTHROPIC_API_KEY as its key"
+            );
+        }
+        // The generic API_KEY still counts for every provider.
+        let only_generic = |v: &str| (v == "API_KEY").then(|| "k".to_string());
+        assert!(api_key_in_env_with("openai", only_generic));
+        assert!(api_key_in_env_with("anthropic", only_generic));
+        // An empty value is not a key.
+        assert!(!api_key_in_env_with("openai", |v: &str| (v == "API_KEY").then(String::new)));
     }
 }

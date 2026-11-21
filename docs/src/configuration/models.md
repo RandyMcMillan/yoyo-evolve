@@ -44,7 +44,13 @@ Use `--provider <name>` to select a provider. Each provider has a default model 
 | `cerebras` | `llama-3.3-70b` | `CEREBRAS_API_KEY` |
 | `zai` | `glm-5.3` | `ZAI_API_KEY` |
 | `minimax` | `MiniMax-M2.7` | `MINIMAX_API_KEY` |
-| `custom` | `claude-opus-5-5` | *(none — bring your own)* |
+| `custom` | *(none — `--model` required)* | *(none — bring your own)* |
+
+> **`custom` and unknown providers need a model:** yoyo can't know which
+> models your own OpenAI-compatible server serves, so `--provider custom`
+> (or an unknown provider name with `--base-url`) and no `--model` / `model =`
+> stops with exit 2 before sending anything. `curl <base_url>/models` lists
+> the ids your server has. (Before #1175 it silently sent `claude-opus-5-5`.)
 
 > **Note:** the table shows each provider's *default* model — others are
 > available. For example, MiniMax's flagship `MiniMax-M3` can be selected via
@@ -72,7 +78,7 @@ Use `--provider <name>` to select a provider. Each provider has a default model 
 OPENAI_API_KEY=sk-... yoyo --provider openai
 
 # Google Gemini
-GOOGLE_API_KEY=... yoyo --provider google --model gemini-2.5-pro
+GOOGLE_API_KEY=... yoyo --provider google --model gemini-3.1-pro-preview
 
 # Local with Ollama (no API key needed)
 yoyo --provider ollama --model llama3.2
@@ -147,15 +153,36 @@ Gemini 4 Argon and Gemini 3.8 Flash bill Google's introductory rate until its st
 the regular rate after (since Day 242; see [Cost Tracking](../features/cost-tracking.md)). Near-miss ids (`gemini-3.8-flash-lite`, `grok-4.7-mini`, `mistral-large-latest`,
 `glm-5.4`) keep the generic defaults.
 
+Since yoagent 0.27.6, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` and
+`gemini-3-flash-preview` are yoagent presets too (as `gemini-3.6-flash` and
+`gemini-3.1-pro-preview` already were), with the same limits and yoagent's prices. Since
+yoagent 0.27.7, `gemini-2.5-flash-lite` (which Google says "is not deprecated and remains
+available through the API until further notice") is a yoagent preset as well, so every Gemini id
+yoyo offers runs on yoagent's preset limits: for 2.5 Flash-Lite, 1,048,576 input tokens and 65,536
+output tokens, as its page under
+[ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models) publishes.
+yoyo keeps no Gemini limits table of its own. `/model info` prints the same
+window and output cap, a `max_tokens` above 65,536 gets the declared-ceiling warning, and your own
+`max_tokens` / `context_window` still win. yoyo's Google provider sends `maxOutputTokens` only
+when you set `max_tokens`; otherwise Google applies its own default.
+
+yoyo no longer offers `gemini-2.5-pro` or `gemini-2.5-flash`. Google's
+[deprecations page](https://ai.google.dev/gemini-api/docs/deprecations) (read 2026-11-09) says
+they are closed to new users and that from December 1, 2026 requests to them route to
+`gemini-3.8-flash` and `gemini-3.5-flash-lite`. If you already use one, you can still pass it with
+`--model`. You will get the `Unknown model` and guessed-limits warnings, `/model info` shows the
+window as unknown, and `/cost` still prices it at the 2.5 rate (for `gemini-2.5-pro` that is wrong from December 1, when Google bills 3.8 Flash rates; tracked in #1012).
+
 ### Models with no preset run on guessed limits
 
 A model id yoyo has no preset for runs on its provider's guess: the limits that provider hands
 every id it does not know. On the OpenAI-compatible providers `openai`, `openrouter`, `xai`, `groq`,
 `mistral`, `cerebras`, `github` and `zai` that is a 128,000-token context window and
-`max_tokens = 4096`; on `minimax` a 1M window and `max_tokens = 4096`; on `google` a 1M window and
-`max_tokens = 8192` (this is what `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` and
-`gemini-2.0-flash` run on today). That cap covers reasoning plus answer on every turn, so a newer
-model (for example a GPT release newer than yoyo's presets) can be cut short. yoyo now says so once per model on stderr, even in
+`max_tokens = 4096`; on `minimax` a 1M window and `max_tokens = 4096`. That cap covers reasoning
+plus answer on every turn, so a newer model (for example a GPT release newer than yoyo's presets)
+can be cut short. On `google` (a `gemini-*` id that is not a yoagent preset) the guess is a 1M window, and no output cap is sent at all: the request carries no
+`maxOutputTokens` unless you set `max_tokens`, so Google applies the model's own default output
+limit, and the warning says that instead of naming a cap. yoyo now says so once per model on stderr, even in
 quiet or piped runs (stdout is unchanged):
 
 ```text
@@ -179,17 +206,36 @@ those too. Anthropic ids with a preset, such as the default `claude-opus-5-5`, a
 On `bedrock`, the limits come from yoagent's Bedrock preset: a Claude id it knows, bare or behind one
 of AWS's cross-region prefixes (`global.`, `us.`, `us-gov.`, `eu.`, `apac.`, `jp.`, `au.`, `ca.`,
 `in.`), takes the same limits as the Anthropic model, so the default `anthropic.claude-sonnet-4-6`
-runs on a 1,000,000 window with `max_tokens = 64000` and is not warned about. Your `base_url` (the
+runs on a 1,000,000 window with `max_tokens = 64000` and is not warned about. For these Claude ids
+the request always carries an `inferenceConfig.maxTokens`, so the answer length is never left to
+whatever default Bedrock applies (#1173, #1198). With `--thinking` off and no `max_tokens` set,
+yoyo sends that output maximum. With `--thinking` on, yoagent (0.27.9 and later) picks the cap, by
+the same rule as the first-party Anthropic path: your `max_tokens`, else the preset's output
+maximum, raised to the thinking budget + 1024 when it is not above the budget (Anthropic requires
+the budget to be below `max_tokens`). So `--thinking high --max-tokens 2048` sends `maxTokens = 9216`
+against a budget of 8192, not 2048. A `max_tokens` above the budget is sent as given. Per yoagent's
+0.27.9 release note, Bedrock reserves the cap it is sent against your account's tokens-per-minute quota while the request runs,
+so a 64000 preset cap reserves 64000. Your `base_url` (the
 Region) is kept. Any other `bedrock` id (`amazon.nova-pro-v1:0`, a Claude id yoagent has no preset
 for, or a Claude id spelled with a prefix or version suffix AWS doesn't use, such as
-`xx.anthropic.claude-sonnet-4-6`) runs on the 200,000 / 16000 guess and warns.
+`xx.anthropic.claude-sonnet-4-6`) runs on a guessed 200,000-token window and warns. With
+`--thinking` off, the 16000 `max_tokens` in that guess is not sent, as on `google`: the Converse
+request carries no `inferenceConfig.maxTokens` unless you set `max_tokens`, so Bedrock applies the
+model's own default output limit. With `--thinking` on, the guessed 16000 is sent as the cap (raised
+above the budget if it is not already above it). The warning names both cases instead of
+naming one cap. The `/side` and `/architect` agents run with thinking off and send the cap the
+main agent sends with thinking off, on every provider: your `max_tokens` if set, and on `bedrock`
+with it unset, the preset's output maximum for a Claude id (no cap for an id with no preset) (#1203).
 
 A value for `--max-tokens`, `--temperature`, `--max-turns` or `--context-window` that is not a
 number (`--max-tokens abc`) is refused at startup with exit 2, before any request is sent; it no
 longer warns and runs on the default. The same mistake in `.yoyo.toml` (`max_tokens = "abc"`) still
 only warns (naming the key and saying it came from a config file) and falls back to the default, because a project's
 `.yoyo.toml` may have been written by someone else. Parseable values out of range (such as
-`--temperature 5`) are handled as before (temperature is clamped to 0.0–1.0 with a warning).
+`--temperature 5`) are handled as before: temperature is clamped to the provider's range with a
+warning. The range is 0.0–2.0 on `openai`, `google`, `deepseek`, `groq` and `cerebras`, whose API
+references document 0–2, and 0.0–1.0 on every other provider (#1207). On `xai` the API accepts 0–2
+but samples at most 1. A fallback or `/provider` switch clamps again to the new provider's range.
 
 ## Context window
 

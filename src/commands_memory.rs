@@ -6,11 +6,34 @@
 //! `memory::ProjectMemory` through helpers already living in `src/memory.rs`,
 //! so the move is purely mechanical and carries no behavioral risk.
 
+use crate::commands_dev::DoctorSurface;
 use crate::format::*;
 use crate::memory::{
     add_memory_with_category, format_relative_time, is_valid_category, load_memories,
-    remove_memory, save_memories, search_memories, MEMORY_CATEGORIES,
+    load_memories_for_write, memory_file_path, remove_memory, save_memories_to, search_memories,
+    MemoryEntry, MEMORY_CATEGORIES,
 };
+use std::path::Path;
+
+/// `/remember`'s load -> add -> save on `path`: the new total, or a refusal
+/// when the store exists but can't be read or parsed (nothing written, #1216).
+pub(crate) fn remember_at(path: &Path, note: &str, category: &str) -> Result<usize, String> {
+    let mut memory = load_memories_for_write(path)?;
+    add_memory_with_category(&mut memory, note, category);
+    save_memories_to(&memory, path).map_err(|e| format!("error saving memory: {e}"))?;
+    Ok(memory.entries.len())
+}
+
+/// `/forget`'s load -> remove -> save on `path`: the removed entry (`None` if
+/// `index` is out of range, nothing written) and the count left, or a refusal.
+pub(crate) fn forget_at(path: &Path, index: usize) -> Result<(Option<MemoryEntry>, usize), String> {
+    let mut memory = load_memories_for_write(path)?;
+    let removed = remove_memory(&mut memory, index);
+    if removed.is_some() {
+        save_memories_to(&memory, path).map_err(|e| format!("error saving memory: {e}"))?;
+    }
+    Ok((removed, memory.entries.len()))
+}
 
 // ── /remember ────────────────────────────────────────────────────────────
 
@@ -79,35 +102,49 @@ pub fn handle_remember(input: &str) {
             return;
         }
     };
-    let mut memory = load_memories();
-    add_memory_with_category(&mut memory, actual_note, category);
-    match save_memories(&memory) {
-        Ok(_) => {
+    match remember_at(&memory_file_path(), actual_note, category) {
+        Ok(total) => {
             let cat_label = if category == "general" {
                 String::new()
             } else {
                 format!(" [{category}]")
             };
             println!(
-                "{GREEN}  ✓ Remembered{cat_label}: \"{actual_note}\" ({} total memories){RESET}\n",
-                memory.entries.len()
+                "{GREEN}  ✓ Remembered{cat_label}: \"{actual_note}\" ({total} total memories){RESET}\n"
             );
         }
         Err(e) => {
-            eprintln!("{RED}  error saving memory: {e}{RESET}\n");
+            eprintln!("{RED}  {e}{RESET}\n");
         }
     }
 }
 
 // ── /memories ────────────────────────────────────────────────────────────
 
-pub fn handle_memories(input: &str) {
+/// How to add a memory, as `surface` can do it (#1127). There is no
+/// `yoyo remember`, so the shell line says it is a REPL command.
+pub(crate) fn add_memory_hint(surface: DoctorSurface) -> &'static str {
+    match surface {
+        DoctorSurface::Repl => "Use /remember <note> to add one.",
+        DoctorSurface::Shell => "Add one in the REPL: run `yoyo`, then /remember <note>.",
+    }
+}
+
+/// How to remove a memory, as `surface` can do it; no `yoyo forget` either.
+pub(crate) fn forget_memory_hint(surface: DoctorSurface) -> &'static str {
+    match surface {
+        DoctorSurface::Repl => "Use /forget <n> to remove a memory.",
+        DoctorSurface::Shell => "Remove one in the REPL: run `yoyo`, then /forget <n>.",
+    }
+}
+
+pub fn handle_memories(input: &str, surface: DoctorSurface) {
     let query = input.strip_prefix("/memories").unwrap_or("").trim();
 
     let memory = load_memories();
     if memory.entries.is_empty() {
         println!("{DIM}  No project memories yet.");
-        println!("  Use /remember <note> to add one.{RESET}\n");
+        println!("  {}{RESET}\n", add_memory_hint(surface));
         return;
     }
 
@@ -122,7 +159,7 @@ pub fn handle_memories(input: &str) {
                 format_relative_time(&entry.timestamp)
             );
         }
-        println!("  Use /forget <n> to remove a memory.{RESET}\n");
+        println!("  {}{RESET}\n", forget_memory_hint(surface));
     } else {
         // Search memories
         let results = search_memories(&memory, query);
@@ -146,7 +183,7 @@ pub fn handle_memories(input: &str) {
                     format_relative_time(&entry.timestamp)
                 );
             }
-            println!("  Use /forget <n> to remove a memory.{RESET}\n");
+            println!("  {}{RESET}\n", forget_memory_hint(surface));
         }
     }
 }
@@ -167,25 +204,20 @@ pub fn handle_forget(input: &str) {
             return;
         }
     };
-    let mut memory = load_memories();
-    match remove_memory(&mut memory, index) {
-        Some(removed) => match save_memories(&memory) {
-            Ok(_) => {
-                println!(
-                    "{GREEN}  ✓ Forgot: \"{}\" ({} memories remaining){RESET}\n",
-                    removed.note,
-                    memory.entries.len()
-                );
-            }
-            Err(e) => {
-                eprintln!("{RED}  error saving memory: {e}{RESET}\n");
-            }
-        },
-        None => {
-            eprintln!(
-                "{RED}  error: index {index} out of range (have {} memories). Use /memories to see indexes.{RESET}\n",
-                memory.entries.len()
+    match forget_at(&memory_file_path(), index) {
+        Ok((Some(removed), left)) => {
+            println!(
+                "{GREEN}  ✓ Forgot: \"{}\" ({left} memories remaining){RESET}\n",
+                removed.note
             );
+        }
+        Ok((None, have)) => {
+            eprintln!(
+                "{RED}  error: index {index} out of range (have {have} memories). Use /memories to see indexes.{RESET}\n"
+            );
+        }
+        Err(e) => {
+            eprintln!("{RED}  {e}{RESET}\n");
         }
     }
 }

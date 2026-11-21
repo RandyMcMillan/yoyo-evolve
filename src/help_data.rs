@@ -426,12 +426,15 @@ pub fn command_help(cmd: &str) -> Option<&'static str> {
              when to /compact.",
         ),
         "save" => Some(
-            "/save [path] — Save session to file\n\n\
+            "/save [path] [--force] — Save session to file\n\n\
              Usage:\n\
              \x20 /save              Save to yoyo-session.json\n\
-             \x20 /save <path>       Save to specified path\n\n\
+             \x20 /save <path>       Save to specified path\n\
+             \x20 /save <path> --force  Replace an existing file\n\n\
              Saves the full conversation history to a JSON file so it can\n\
-             be resumed later with /load.\n\n\
+             be resumed later with /load. An existing file is only replaced\n\
+             if this yoyo process saved or loaded it (so /save again just\n\
+             works); any other existing file needs --force.\n\n\
              Examples:\n\
              \x20 /save\n\
              \x20 /save my-debug-session.json",
@@ -909,7 +912,8 @@ pub fn command_help(cmd: &str) -> Option<&'static str> {
              \x20 /spawn --bg <task>              Run in background (returns immediately)\n\
              \x20 /spawn --parallel <task1> --- <task2> [--- <task3>...]\n\
              \x20                                 Run multiple tasks concurrently\n\
-             \x20 /spawn -o <file> <task>         Capture output to a file\n\
+             \x20 /spawn -o <file> <task>         Capture output to a file (refuses an existing one)\n\
+             \x20 /spawn -o <file> --force <task> Replace an existing output file\n\
              \x20 /spawn --model <name> <task>    Use a specific model for the subagent\n\
              \x20 /spawn --system <prompt> <task> Custom system prompt for the subagent\n\
              \x20 /spawn --bg -o <f> <task>       Background with output capture\n\
@@ -1095,8 +1099,11 @@ pub fn command_help(cmd: &str) -> Option<&'static str> {
              Usage:\n\
              \x20 /provider <name>    Switch to the specified provider\n\n\
              Changes the active AI provider and resets the model to that\n\
-             provider's default. Tab-completion is available.\n\n\
-             Providers: anthropic, openai, google, deepseek, openrouter, local\n\n\
+             provider's default. Tab-completion is available.\n\
+             `custom` has no default (your server's models are yours to\n\
+             name), so it is refused here and nothing changes; start yoyo\n\
+             with --provider custom --model <id> instead.\n\n\
+             Providers: anthropic, openai, google, deepseek, openrouter, custom\n\n\
              Examples:\n\
              \x20 /provider openai\n\
              \x20 /provider google",
@@ -1192,11 +1199,14 @@ pub fn command_help(cmd: &str) -> Option<&'static str> {
              \x20 /open Cargo.toml 10",
         ),
         "export" => Some(
-            "/export [path] — Export conversation as readable markdown\n\n\
+            "/export [path] [--force] — Export conversation as readable markdown\n\n\
              Usage:\n\
              \x20 /export              Export to conversation.md\n\
-             \x20 /export <path>       Export to specified path\n\n\
+             \x20 /export <path>       Export to specified path\n\
+             \x20 /export <path> --force  Replace the file if it already exists\n\n\
              Saves the current conversation as a formatted markdown file.\n\
+             An existing file is never replaced without --force: /export\n\
+             refuses, writes nothing, and prints the command to overwrite.\n\
              User messages, assistant responses, thinking blocks, and tool\n\
              results are all included in a readable format.\n\n\
              Examples:\n\

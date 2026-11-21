@@ -385,7 +385,7 @@ impl AgentTool for StreamingBashTool {
         // Safety analysis — soft warning that routes through confirmation
         if let Some(warning) = analyze_bash_command(command) {
             if let Some(ref confirm) = self.confirm_fn {
-                if !confirm(&format!("⚠️  {warning}\nCommand: {command}")) {
+                if !confirm(&format!("⚠️  {warning}{WARNED_COMMAND_SEP}{command}")) {
                     return Err(ToolError::Failed(
                         "Command was not confirmed by the user.".into(),
                     ));
@@ -473,12 +473,13 @@ impl AgentTool for StreamingBashTool {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        let accumulated = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let truncated = Arc::new(AtomicBool::new(false));
+        // Head + tail, like yoagent 0.27.5's bash: the verdict comes last (#1159).
+        let accumulated = Arc::new(tokio::sync::Mutex::new(
+            crate::bash_output_cap::HeadTailCap::new(max_bytes),
+        ));
 
         // Spawn a task to read stdout + stderr lines and accumulate them
         let acc_clone = Arc::clone(&accumulated);
-        let trunc_clone = Arc::clone(&truncated);
         let cancel_clone = cancel.clone();
         let ctx_clone = ctx.clone();
         let emit_progress = !self.progress_requires_tty || crate::format::stderr_is_terminal();
@@ -533,21 +534,8 @@ impl AgentTool for StreamingBashTool {
                 };
 
                 if let Some((line, is_stderr)) = line_info {
-                    let mut acc = acc_clone.lock().await;
-                    if acc.len() < max_bytes {
-                        if !acc.is_empty() {
-                            acc.push('\n');
-                        }
-                        acc.push_str(&line);
-                        if acc.len() > max_bytes {
-                            let safe_len = crate::format::safe_truncate(&acc, max_bytes).len();
-                            acc.truncate(safe_len);
-                            acc.push_str("\n... (output truncated)");
-                            trunc_clone.store(true, Ordering::Relaxed);
-                        }
-                    }
+                    acc_clone.lock().await.push_line(&line);
                     lines_since_update += 1;
-                    drop(acc);
 
                     // Emit real-time progress for each line (interactive mode only)
                     if emit_progress {
@@ -564,7 +552,7 @@ impl AgentTool for StreamingBashTool {
                     // Emit update if interval elapsed or enough lines accumulated
                     let elapsed = last_update.elapsed();
                     if elapsed >= update_interval || lines_since_update >= lines_per_update {
-                        let snapshot = acc_clone.lock().await.clone();
+                        let snapshot = acc_clone.lock().await.render();
                         emit_update(&ctx_clone, &snapshot);
                         lines_since_update = 0;
                         last_update = tokio::time::Instant::now();
@@ -591,7 +579,7 @@ impl AgentTool for StreamingBashTool {
                     reader_handle.abort();
                     let _ = reader_handle.await;
                 }
-                let partial = accumulated.lock().await.clone(); // already capped by the reader
+                let partial = accumulated.lock().await.render(); // already capped by the reader
                 return Err(ToolError::Failed(timed_out_message(timeout.as_secs(), &partial)));
             }
             status = child.wait() => {
@@ -628,7 +616,7 @@ impl AgentTool for StreamingBashTool {
         // (#878) — this used to be an inline copy here and a bare
         // `unwrap_or(-1)` in both of those.
         let exit_code = exit_code_of(&exit_status);
-        let output = accumulated.lock().await.clone();
+        let output = accumulated.lock().await.render();
 
         // One final update with the complete output
         emit_update(&ctx, &output);
@@ -1240,6 +1228,17 @@ pub fn build_tools(
     )
 }
 
+/// What sits between a soft warning and the command in the confirm text.
+const WARNED_COMMAND_SEP: &str = "\nCommand: ";
+
+/// The command inside a confirm text: `execute` hands the callback either the
+/// command or `⚠️  {warning}{WARNED_COMMAND_SEP}{command}`.
+pub(crate) fn warned_command(text: &str) -> &str {
+    text.strip_prefix("⚠️")
+        .and_then(|t| t.split_once(WARNED_COMMAND_SEP))
+        .map_or(text, |(_, c)| c)
+}
+
 /// Build the bash tool for one session. User `deny` patterns are installed on
 /// the tool itself (`StreamingBashTool::user_deny`, checked in `execute`), so
 /// they bind on every path: `--yes` gets no confirm closure at all, and a prior
@@ -1266,29 +1265,31 @@ pub(crate) fn build_bash_tool(
         deny: Vec::new(),
     };
     base_bash.with_confirm(move |cmd: &str| {
-            // If user previously chose "always", skip the prompt
-            if flag.load(Ordering::Relaxed) {
-                eprintln!(
-                    "{GREEN}  ✓ Auto-approved: {RESET}{}",
-                    truncate_with_ellipsis(cmd, 120)
-                );
-                return true;
-            }
-            // Check permission patterns before prompting
-            if let Some(allowed) = perms.check(cmd) {
-                if allowed {
-                    eprintln!(
-                        "{GREEN}  ✓ Permitted: {RESET}{}",
-                        truncate_with_ellipsis(cmd, 120)
-                    );
+            // "always", then the allow list, approve without asking, except a
+            // command yoyo cannot read (#1202 step 1: fails closed to a prompt).
+            use crate::bash_parse::{pre_prompt_route, unanalyzable_reason, PrePrompt};
+            let always = flag.load(Ordering::Relaxed);
+            let allow = perms.check(cmd);
+            let unreadable = unanalyzable_reason(warned_command(cmd));
+            match pre_prompt_route(always, allow, unreadable.is_some()) {
+                PrePrompt::Approve => {
+                    let label = if always { "Auto-approved" } else { "Permitted" };
+                    let shown = truncate_with_ellipsis(cmd, 120);
+                    eprintln!("{GREEN}  ✓ {label}: {RESET}{shown}");
                     return true;
-                } else {
-                    eprintln!(
-                        "{RED}  ✗ Denied by permission rule: {RESET}{}",
-                        truncate_with_ellipsis(cmd, 120)
-                    );
+                }
+                PrePrompt::Refuse => {
+                    let shown = truncate_with_ellipsis(cmd, 120);
+                    eprintln!("{RED}  ✗ Denied by permission rule: {RESET}{shown}");
                     return false;
                 }
+                PrePrompt::Ask => {}
+            }
+            if let Some(reason) = unreadable.filter(|r| !cmd.contains(r.as_str())) {
+                eprintln!("{YELLOW}  ⚠ {reason}{RESET}");
+            }
+            if always || allow == Some(true) {
+                eprintln!("{DIM}  (asking even though \"always\" or an allow rule matched){RESET}");
             }
             use std::io::BufRead;
             // Show the command and ask for approval
@@ -1665,7 +1666,9 @@ pub(crate) fn child_confirm_refusal(parent_confirms: bool, command: &str) -> Opt
     if !parent_confirms {
         return None;
     }
-    let warning = analyze_bash_command(command)?;
+    // #1202 step 1: what the parent would ask about even after "always".
+    let warning = analyze_bash_command(command)
+        .or_else(|| crate::bash_parse::unanalyzable_reason(command))?;
     Some(format!(
         "Command needs user confirmation that a sub-agent cannot obtain: {warning} \
          Return this step to the parent agent and let it run the command itself, \
@@ -3003,13 +3006,16 @@ mod tests {
         let result = tool.execute(params, ctx).await.unwrap();
         match &result.content[0] {
             yoagent::types::Content::Text { text } => {
-                // The accumulated output should have been truncated
-                // Total text = "Exit code: 0\n" + accumulated (which was truncated to ~100 bytes)
+                // Head + tail are kept (#1159): the first line, the LAST line
+                // (where a verdict lives), and the exact omitted count.
+                assert!(text.starts_with("Exit code: 0\nline number 1 of"), "{text}");
+                assert!(text.ends_with("line number 100 of the output"), "{text}");
+                assert!(text.contains("bytes omitted) ...\n"), "{text}");
                 assert!(
-                    text.contains("truncated") || text.len() < 500,
-                    "Output should be truncated or short, got {} bytes",
-                    text.len()
+                    !text.contains("line number 50 of"),
+                    "middle dropped: {text}"
                 );
+                assert!(text.len() < 300, "capped, got {} bytes", text.len());
             }
             _ => panic!("Expected text content"),
         }

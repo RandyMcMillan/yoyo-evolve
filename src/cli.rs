@@ -20,7 +20,7 @@ pub use crate::providers::{
 pub use crate::config::{
     history_file_path, home_config_path, load_config_file, parse_config_file,
     parse_directories_from_config, parse_mcp_servers_from_config, parse_permissions_from_config,
-    parse_toml_array, user_config_path, DirectoryRestrictions, McpServerConfig, PermissionConfig,
+    user_config_path, DirectoryRestrictions, McpServerConfig, PermissionConfig,
 };
 
 /// Whether verbose output is enabled. Set once at startup.
@@ -647,15 +647,24 @@ pub fn help_text() -> String {
 // Banner/welcome display — extracted to banner.rs for readability.
 pub use crate::banner::{print_banner, print_welcome};
 
-/// Parse a thinking level string into a ThinkingLevel enum.
-pub fn parse_thinking_level(s: &str) -> ThinkingLevel {
-    match s.to_lowercase().as_str() {
+/// The level a thinking string names, or `None` for an unknown word. Pure (no
+/// warning), so `config get` can read it too (#1195).
+pub fn thinking_level_from_str(s: &str) -> Option<ThinkingLevel> {
+    Some(match s.to_lowercase().as_str() {
         "off" | "none" => ThinkingLevel::Off,
         "minimal" | "min" => ThinkingLevel::Minimal,
         "low" => ThinkingLevel::Low,
         "medium" | "med" => ThinkingLevel::Medium,
         "high" | "max" => ThinkingLevel::High,
-        _ => {
+        _ => return None,
+    })
+}
+
+/// Parse a thinking level string into a ThinkingLevel enum.
+pub fn parse_thinking_level(s: &str) -> ThinkingLevel {
+    match thinking_level_from_str(s) {
+        Some(level) => level,
+        None => {
             eprintln!(
                 "{YELLOW}warning:{RESET} Unknown thinking level '{s}', using 'medium'. \
                  Valid: off, minimal, low, medium, high"
@@ -665,17 +674,22 @@ pub fn parse_thinking_level(s: &str) -> ThinkingLevel {
     }
 }
 
-/// Clamp temperature to the valid 0.0–1.0 range, warning if out of bounds.
-pub fn clamp_temperature(t: f32) -> f32 {
-    if t < 0.0 {
-        eprintln!("{YELLOW}warning:{RESET} Temperature {t} is below 0.0, clamping to 0.0");
-        0.0
-    } else if t > 1.0 {
-        eprintln!("{YELLOW}warning:{RESET} Temperature {t} is above 1.0, clamping to 1.0");
-        1.0
-    } else {
-        t
+/// `t` clamped to `provider`'s range, with no warning (#1195: `config get`
+/// reads it). The bound is `temperature_support`'s, per provider (#1207).
+pub fn clamped_temperature(provider: &str, t: f32) -> f32 {
+    crate::temperature_support::clamped_temperature_for(provider, t)
+}
+
+/// Clamp temperature to `provider`'s range, warning if out of bounds.
+pub fn clamp_temperature(provider: &str, t: f32) -> f32 {
+    let used = clamped_temperature(provider, t);
+    if used != t && !t.is_nan() {
+        let range = crate::temperature_support::temperature_range_label(provider);
+        eprintln!(
+            "{YELLOW}warning:{RESET} Temperature {t} is outside {range}, clamping to {used:?}"
+        );
     }
+    used
 }
 
 /// Compute the list of disallowed tools for lite mode.
@@ -1070,7 +1084,7 @@ pub fn resolve_system_prompt(
                 eprintln!(
                     "{RED}error:{RESET} Failed to read system_file '{path}' from config: {e}"
                 );
-                std::process::exit(1);
+                crate::dispatch_sub::exit_process(1);
             }
         }
     }
@@ -1133,9 +1147,9 @@ fn parse_model_config(
         .unwrap_or_else(|| "anthropic".into())
         .to_lowercase();
 
-    // Parse --base-url flag (CLI > config file)
+    // --base-url flag > config file; a project file's URL needs trust (#1179)
     let base_url =
-        flag_value(args, &["--base-url"]).or_else(|| file_config.get("base_url").cloned());
+        crate::project_base_url::resolve_base_url(args, file_config, &provider, is_trust_project());
 
     // #1103: an unknown provider with no base URL is a typo, not a choice; refuse
     // before any network call instead of sending the fallback key to localhost:8080.
@@ -1143,10 +1157,11 @@ fn parse_model_config(
     let url_given = base_url.as_deref().is_some_and(|u| !u.trim().is_empty());
     if let Some(msg) = crate::providers::unknown_provider_refusal(&provider, url_given) {
         eprintln!("{RED}error:{RESET} {msg}");
-        std::process::exit(2);
+        crate::dispatch_sub::exit_process(2);
     }
 
-    // API key: --api-key flag > provider-specific env > ANTHROPIC_API_KEY > API_KEY > config file
+    // API key: --api-key flag > provider-specific env > API_KEY > config file (#1170:
+    // ANTHROPIC_API_KEY only for anthropic, where it is the provider-specific env)
     let api_key_from_flag = flag_value(args, &["--api-key"]);
 
     // Choose provider-specific env var name
@@ -1169,13 +1184,13 @@ fn parse_model_config(
             match from_provider_env.zip(provider_var) {
                 Some((key, var)) => (key, KeySource::Env(var)),
                 None => {
-                    // Fallback chain: ANTHROPIC_API_KEY > API_KEY > config file
-                    let var = match std::env::var("ANTHROPIC_API_KEY") {
-                        Ok(_) => "ANTHROPIC_API_KEY",
-                        Err(_) => "API_KEY",
-                    };
-                    match std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("API_KEY")) {
-                        Ok(key) if !key.is_empty() => (key, KeySource::Env(var.to_string())),
+                    // Fallback chain: API_KEY > config file. ANTHROPIC_API_KEY is
+                    // Anthropic's credential by name and anthropic's own variable
+                    // (found above), so it is never a fallback for another
+                    // provider: before #1170 it went as a bearer token to ollama,
+                    // custom proxies, openai, bedrock... whenever theirs was unset.
+                    match std::env::var("API_KEY") {
+                        Ok(key) if !key.is_empty() => (key, KeySource::Env("API_KEY".to_string())),
                         _ => match file_config.get("api_key").cloned() {
                             Some(key) if !key.is_empty() => (key, KeySource::ConfigFile),
                             _ => {
@@ -1191,12 +1206,12 @@ fn parse_model_config(
                                     (String::new(), KeySource::Missing)
                                 } else {
                                     // Piped/single-shot mode: terse error for scripts
-                                    let env_hint = provider_env_var.unwrap_or("ANTHROPIC_API_KEY");
+                                    let env_hint = provider_env_var.unwrap_or("API_KEY");
                                     eprintln!("{RED}error:{RESET} No API key found.");
                                     eprintln!(
                                         "Set {env_hint} env var, use --api-key <key>, or add api_key to .yoyo.toml."
                                     );
-                                    std::process::exit(1);
+                                    crate::dispatch_sub::exit_process(1);
                                 }
                             }
                         },
@@ -1212,11 +1227,20 @@ fn parse_model_config(
         crate::prompt_retry::set_key_source(key_source);
     }
 
-    let model = flag_value(args, &["--model"])
+    let named_model = flag_value(args, &["--model"])
         .or_else(|| file_config.get("model").cloned())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default_model_for_provider(&provider));
+        .and_then(|s| crate::config_value::named_model(&s));
+    // #1175: a user-run server's models are the user's to name, not ours to guess.
+    let refusal = crate::providers::named_model_required_refusal(
+        &provider,
+        named_model.as_deref(),
+        base_url.as_deref(),
+    );
+    if let Some(msg) = refusal {
+        eprintln!("{RED}error:{RESET} {msg}");
+        crate::dispatch_sub::exit_process(2);
+    }
+    let model = named_model.unwrap_or_else(|| default_model_for_provider(&provider));
 
     // Warn if model isn't known for this provider. The check goes through
     // `providers::model_is_known_for_provider` — the same resolution rule the
@@ -1279,7 +1303,9 @@ pub(crate) fn unknown_model_warning(provider: &str, model: &str) -> Option<Strin
 /// user-declared `custom` endpoint all take foreign ids on purpose, so a warning
 /// here would be crying wolf at a supported setup. The `--base-url` clause below
 /// covers the same ground for single-vendor providers pointed at a gateway.
-const MULTI_VENDOR_PROVIDERS: &[&str] = &["openrouter", "ollama", "github", "custom"];
+// `github` left this list with #1166: retired, it only runs with a base URL,
+// and `base_url_given` returns before this list is read.
+const MULTI_VENDOR_PROVIDERS: &[&str] = &["openrouter", "ollama", "custom"];
 
 /// The `--provider`/`--model` disagreement warning, or `None` when the pair is
 /// consistent (or consistent enough that warning would be guessing).
@@ -2260,7 +2286,6 @@ fn project_mcp_refusal_message(refused: &[String], plain: bool) -> String {
 /// in so the gating decision itself stays pure (`gate_mcp_sources`).
 fn parse_mcp_and_openapi_config(
     args: &[String],
-    file_config: &HashMap<String, String>,
     raw_config_content: &str,
     project_local: bool,
     trusted: bool,
@@ -2269,10 +2294,7 @@ fn parse_mcp_and_openapi_config(
     let cli_servers = collect_repeatable_flag(args, "--mcp");
 
     // MCP servers declared by the config file (`mcp = [...]`)
-    let config_servers = file_config
-        .get("mcp")
-        .map(|raw| parse_toml_array(raw))
-        .unwrap_or_default();
+    let config_servers = crate::config::parse_mcp_list_from_config(raw_config_content);
 
     // Parse structured [mcp_servers.*] sections from config file
     let config_server_configs = parse_mcp_servers_from_config(raw_config_content);
@@ -2280,8 +2302,8 @@ fn parse_mcp_and_openapi_config(
     // ONE emission point for the whitespace warning, covering BOTH MCP doors: both
     // `config_servers` (`mcp = [...]`) and `config_server_configs` (`[mcp_servers.*]`)
     // are in hand here, and this is the only production site where that is true. The
-    // detection deliberately does NOT live inside `parse_toml_array`, which is shared
-    // with [permissions] and [directories] — a warning there would fire on glob
+    // detection deliberately does NOT live inside the `mcp` list reader; the old shared
+    // array reader also served [permissions] and [directories], where it would fire on glob
     // patterns this task never measured. Emitting at one of the two doors and not the
     // other is the "two doors, one policy, one deaf" shape this repo has shipped nine
     // times.
@@ -2415,7 +2437,7 @@ pub(crate) fn parse_args_with_config(
         .or_else(|| crate::cli_config::stray_prompt_word_refusal(full_args))
     {
         eprintln!("{RED}error:{RESET} {msg}");
-        std::process::exit(2); // #1109: before the trust prompt, wizard and any request
+        crate::dispatch_sub::exit_process(2); // #1109: before the trust prompt, wizard and any request
     }
 
     // --continue-on-silence: opt-in (issue #631). Treat a tool-using turn that
@@ -2693,12 +2715,12 @@ directory ({e}); this run is trusted, later runs will not be."
             FlagIssue::Empty { flag } => {
                 eprintln!("{RED}error:{RESET} {flag} requires a non-empty value");
                 eprintln!("Run with --help for usage information.");
-                std::process::exit(1);
+                crate::dispatch_sub::exit_process(1);
             }
             FlagIssue::Missing { flag } => {
                 eprintln!("{RED}error:{RESET} {flag} requires a value");
                 eprintln!("Run with --help for usage information.");
-                std::process::exit(1);
+                crate::dispatch_sub::exit_process(1);
             }
         }
     }
@@ -2707,7 +2729,7 @@ directory ({e}); this run is trusted, later runs will not be."
     warn_unknown_flags(args, flags_needing_values);
     if let Some(msg) = crate::cli_config::bad_numeric_flag_refusal(args) {
         eprintln!("{RED}error:{RESET} {msg}");
-        std::process::exit(2); // before any agent or request (Day 244)
+        crate::dispatch_sub::exit_process(2); // before any agent or request (Day 244)
     }
 
     // Parse prompt and image flags early so we can validate --image before API key check
@@ -2730,12 +2752,12 @@ directory ({e}); this run is trusted, later runs will not be."
             let path = std::path::Path::new(img_path.as_str());
             if !path.exists() {
                 eprintln!("{RED}error:{RESET} image file not found: {img_path}");
-                std::process::exit(1);
+                crate::dispatch_sub::exit_process(1);
             }
             if !crate::commands_file::is_image_extension(img_path) {
                 let why = crate::commands_file::image_flag_refusal(img_path);
                 eprintln!("{RED}error:{RESET} {why}");
-                std::process::exit(1);
+                crate::dispatch_sub::exit_process(1);
             }
         }
     }
@@ -2799,7 +2821,7 @@ directory ({e}); this run is trusted, later runs will not be."
         .map(|path| {
             std::fs::read_to_string(path).unwrap_or_else(|e| {
                 eprintln!("{RED}error:{RESET} Failed to read system prompt file '{path}': {e}");
-                std::process::exit(1);
+                crate::dispatch_sub::exit_process(1);
             })
         });
 
@@ -2888,7 +2910,7 @@ directory ({e}); this run is trusted, later runs will not be."
     let max_tokens = parse_numeric_flag::<u32>(args, "--max-tokens", &file_config, "max_tokens");
 
     let temperature = parse_numeric_flag::<f32>(args, "--temperature", &file_config, "temperature")
-        .map(clamp_temperature);
+        .map(|t| clamp_temperature(&mc.provider, t));
 
     let max_turns = parse_numeric_flag::<usize>(args, "--max-turns", &file_config, "max_turns");
 
@@ -2955,7 +2977,6 @@ directory ({e}); this run is trusted, later runs will not be."
     // the MCP servers it declares are not started unless --trust-project says so.
     let mcp = parse_mcp_and_openapi_config(
         args,
-        &file_config,
         &raw_config_content,
         crate::config::loaded_config_is_project_local(),
         is_trust_project(),
@@ -4109,21 +4130,24 @@ mod tests {
 
     #[test]
     fn test_clamp_temperature_in_range() {
-        assert_eq!(clamp_temperature(0.0), 0.0);
-        assert_eq!(clamp_temperature(0.5), 0.5);
-        assert_eq!(clamp_temperature(1.0), 1.0);
+        assert_eq!(clamp_temperature("anthropic", 0.0), 0.0);
+        assert_eq!(clamp_temperature("anthropic", 0.5), 0.5);
+        assert_eq!(clamp_temperature("anthropic", 1.0), 1.0);
+        assert_eq!(clamp_temperature("openai", 1.5), 1.5); // #1207
+        assert_eq!(clamp_temperature("openai", 2.0), 2.0);
     }
 
     #[test]
     fn test_clamp_temperature_below_zero() {
-        assert_eq!(clamp_temperature(-0.5), 0.0);
-        assert_eq!(clamp_temperature(-100.0), 0.0);
+        assert_eq!(clamp_temperature("anthropic", -0.5), 0.0);
+        assert_eq!(clamp_temperature("openai", -100.0), 0.0);
     }
 
     #[test]
-    fn test_clamp_temperature_above_one() {
-        assert_eq!(clamp_temperature(1.5), 1.0);
-        assert_eq!(clamp_temperature(99.0), 1.0);
+    fn test_clamp_temperature_above_the_provider_max() {
+        assert_eq!(clamp_temperature("anthropic", 1.5), 1.0);
+        assert_eq!(clamp_temperature("anthropic", 99.0), 1.0);
+        assert_eq!(clamp_temperature("openai", 2.5), 2.0); // #1207
     }
 
     #[test]
@@ -4475,31 +4499,31 @@ mod tests {
 
     #[test]
     fn test_parse_toml_array_basic() {
-        let arr = parse_toml_array(r#"["git *", "cargo *"]"#);
+        let arr = crate::config::parse_toml_array(r#"["git *", "cargo *"]"#);
         assert_eq!(arr, vec!["git *", "cargo *"]);
     }
 
     #[test]
     fn test_parse_toml_array_single() {
-        let arr = parse_toml_array(r#"["rm -rf *"]"#);
+        let arr = crate::config::parse_toml_array(r#"["rm -rf *"]"#);
         assert_eq!(arr, vec!["rm -rf *"]);
     }
 
     #[test]
     fn test_parse_toml_array_empty() {
-        let arr = parse_toml_array("[]");
+        let arr = crate::config::parse_toml_array("[]");
         assert!(arr.is_empty());
     }
 
     #[test]
     fn test_parse_toml_array_single_quotes() {
-        let arr = parse_toml_array("['git *', 'ls']");
+        let arr = crate::config::parse_toml_array("['git *', 'ls']");
         assert_eq!(arr, vec!["git *", "ls"]);
     }
 
     #[test]
     fn test_parse_toml_array_not_array() {
-        let arr = parse_toml_array("not an array");
+        let arr = crate::config::parse_toml_array("not an array");
         assert!(arr.is_empty());
     }
 

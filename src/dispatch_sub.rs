@@ -136,7 +136,30 @@ fn exit_if_nonzero(code: i32) {
     if code != 0 {
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        std::process::exit(code);
+        exit_process(code);
+    }
+}
+
+/// The one way yoyo's dispatchers and argument parsers end the process
+/// (#1187). In a release or debug binary it is `std::process::exit`. In the
+/// unit-test binary it panics instead: a unit test that reaches an exiting
+/// door used to kill the whole test binary with no test named (CI red ~16h,
+/// 2026-11-12/13, `test_try_dispatch_subcommand_lint`), and a panic fails
+/// exactly that test, by name, while the rest keep running. Integration tests
+/// run the built binary, which is compiled without cfg(test), so their
+/// exit-code assertions still see the real code.
+/// `tests/process_exit_sites.rs` fails on any new direct exit call in `src/`.
+pub(crate) fn exit_process(code: i32) -> ! {
+    #[cfg(not(test))]
+    {
+        std::process::exit(code)
+    }
+    #[cfg(test)]
+    {
+        panic!(
+            "unit test reached the process exit door with code {code}; \
+             test the core function that returns the code, not the door (#1187)"
+        )
     }
 }
 
@@ -358,6 +381,14 @@ fn todo_shell_status(verb: &str) -> i32 {
     2 * i32::from(unknown)
 }
 
+/// `yoyo lint ...` from the shell: the status the arm exits with (#1187: the
+/// arm's decision, testable without the exit door). #1009: plain join;
+/// `/lint` never tokenizes quotes, so the wrapper's `"a b"` was echoed back
+/// (`git "a b"` names it bare). #982: 1 when no recognized project was found.
+fn lint_shell_status(args: &[String]) -> i32 {
+    crate::commands_lint::handle_lint_status(&join_args_as_command(args)).1
+}
+
 /// `yoyo extended` from the shell: always a refusal, since extended mode needs
 /// a live agent session. Prints the usage hint and returns the shell-refusal
 /// status (#982) — it used to exit 0 having run nothing.
@@ -419,7 +450,7 @@ pub(crate) fn try_dispatch_subcommand_in(
             "{}",
             crate::cli::misplaced_subcommand_refusal(args, i, plain)
         );
-        std::process::exit(2);
+        exit_process(2);
     }
     if let Some(sub) = args.get(1) {
         refuse_unknown_verb_flag(args); // #1132: every `Refuse` row, before any arm
@@ -521,12 +552,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                 return Some(None);
             }
             "lint" => {
-                // #1009: plain join; `/lint` never tokenizes quotes, so the
-                // wrapper's `"a b"` was echoed back (`git "a b"` names it bare).
-                let input = join_args_as_command(args);
-                // #982: exits 1 when no recognized project was found.
-                let (_, code) = crate::commands_lint::handle_lint_status(&input);
-                exit_if_nonzero(code);
+                exit_if_nonzero(lint_shell_status(args));
                 return Some(None);
             }
             "security" => {
@@ -604,7 +630,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                 // mistyped flag exits 2 (above the match) instead of a path.
                 let review = build_review_arg(args);
                 let exit_code = run_review_subcommand(args, &review);
-                std::process::exit(exit_code);
+                exit_process(exit_code);
             }
             "blame" => {
                 // #1009: plain join, not `quote_args_as_command` — `/blame`
@@ -627,7 +653,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                 // for the harness (or a human) to record daily risk snapshots
                 // where the DREAM measurement data actually accumulates.
                 let input = build_risk_input(&args[2..]);
-                crate::commands_risk::handle_risk(&input);
+                crate::commands_risk::handle_risk(&input, Shell);
                 exit_if_nonzero(risk_status(&input));
                 return Some(None);
             }
@@ -651,7 +677,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                     Ok(p) => p,
                     Err(refusal) => {
                         eprintln!("{refusal}");
-                        std::process::exit(crate::commands_search::SEARCH_USAGE_EXIT);
+                        exit_process(crate::commands_search::SEARCH_USAGE_EXIT);
                     }
                 };
                 let input = format!("/find {pattern}");
@@ -741,11 +767,11 @@ pub(crate) fn try_dispatch_subcommand_in(
                 // #1111: refused before the docs.rs call for crate `--bogus`.
                 let ops = verb_operands(args);
                 exit_if_nonzero(match ops.as_slice() {
-                    [] => crate::commands_project::handle_docs_status("/docs"),
+                    [] => crate::commands_project::handle_docs_status("/docs", Shell),
                     // An empty/blank crate is still usage (exit 2), as before.
                     [krate, ..] if krate.trim().is_empty() => {
                         let input = join_args_as_command(&verb_with(args, &ops));
-                        crate::commands_project::handle_docs_status(&input)
+                        crate::commands_project::handle_docs_status(&input, Shell)
                     }
                     [krate, item @ ..] => {
                         crate::commands_project::docs_lookup_status(krate, &item.join(" "))
@@ -841,13 +867,16 @@ pub(crate) fn try_dispatch_subcommand_in(
                         // Reconstruct as /config get <key>
                         let key = args.get(3).map(|s| s.as_str()).unwrap_or("");
                         let input = format!("/config get {key}");
-                        exit_if_nonzero(crate::commands_config::handle_config_get_status(&input));
+                        exit_if_nonzero(crate::commands_config::handle_config_get_status(
+                            &input,
+                            crate::commands_dev::DoctorSurface::Shell,
+                        ));
                     }
                     Some(other) => {
-                        eprintln!(
-                            "{YELLOW}  `config {other}` requires an interactive session.{RESET}"
-                        );
-                        eprintln!("{DIM}  Try: yoyo config show (works from the shell){RESET}");
+                        // Unknown words say unknown; only set/edit claim the REPL.
+                        let (headline, hint) =
+                            crate::commands_config_get::config_shell_refusal(other);
+                        eprintln!("{YELLOW}  {headline}{RESET}\n{DIM}  {hint}{RESET}");
                         // #982: a refused or unknown subcommand did not run, so
                         // exit 2 (usage) rather than 0. Covers `set`/`edit` too:
                         // `yoyo config set k v && next` must not read success.
@@ -918,7 +947,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                 let verb = verb.unwrap_or("");
                 if let Some(refusal) = crate::commands_todo::shell_todo_refusal(verb) {
                     eprintln!("{YELLOW}{refusal}{RESET}");
-                    std::process::exit(1);
+                    exit_process(1);
                 }
                 let input = join_args_as_command(&crate::verb_flags::sub_args(args));
                 println!("{}", crate::commands_todo::handle_todo_on(&input, Shell));
@@ -941,7 +970,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                 // re-quoting a multi-word query would search for literal `"`s.
                 // #1111: an unknown flag refuses; `-- -x` searches for `-x`.
                 let input = join_args_as_command(&verb_with(args, &verb_operands(args)));
-                crate::commands_memory::handle_memories(&input);
+                crate::commands_memory::handle_memories(&input, Shell);
                 return Some(None);
             }
             "extended" => {
@@ -966,7 +995,7 @@ pub(crate) fn try_dispatch_subcommand_in(
                 // (#745/#767/#769/#816, "two doors, one works"). An honest refusal
                 // is the whole point of routing it.
                 let exit_code = run_gasp_subcommand(&args[2..]);
-                std::process::exit(exit_code);
+                exit_process(exit_code);
             }
             _ => {}
         }
@@ -1115,12 +1144,8 @@ fn resolve_api_key(args: &[String], provider: &str) -> Option<String> {
         return Some(key);
     }
 
-    // Fallback env vars
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            return Some(key);
-        }
-    }
+    // Generic fallback. Never ANTHROPIC_API_KEY: it is anthropic's own variable
+    // (found above) and must not reach another provider (#1170).
     if let Ok(key) = std::env::var("API_KEY") {
         if !key.is_empty() {
             return Some(key);
@@ -1155,9 +1180,15 @@ fn run_review_subcommand(args: &[String], review: &crate::verb_flags::ReviewArgs
 
     let api_key = match resolve_api_key(args, &provider) {
         Some(key) => key,
+        // A user-run server needs no key, as on the main path (cli.rs). Before
+        // #1170 review only reached these with ANTHROPIC_API_KEY sent as the key.
+        None if crate::model_limits_note::USER_RUN_SERVER_PROVIDERS
+            .contains(&provider.as_str()) =>
+        {
+            "not-needed".to_string()
+        }
         None => {
-            let env_hint =
-                crate::providers::provider_api_key_env(&provider).unwrap_or("ANTHROPIC_API_KEY");
+            let env_hint = crate::providers::provider_api_key_env(&provider).unwrap_or("API_KEY");
             eprintln!(
                 "{RED}error:{RESET} No API key found.\n\
                  Set {env_hint} env var, use --api-key <key>, or add api_key to .yoyo.toml."
@@ -1166,8 +1197,10 @@ fn run_review_subcommand(args: &[String], review: &crate::verb_flags::ReviewArgs
         }
     };
 
+    // #1179: a project file's URL needs trust; review runs before parse_args decides it.
+    let trusted = crate::project_base_url::early_door_trusted(args);
     let base_url =
-        flag_value(args, &["--base-url"]).or_else(|| file_config.get("base_url").cloned());
+        crate::project_base_url::resolve_base_url(args, &file_config, &provider, trusted);
 
     let agent_config = crate::agent_builder::AgentConfig {
         model,
@@ -1753,14 +1786,30 @@ mod tests {
         );
     }
 
+    /// Was `#[ignore]`d after it ran the real linter in-process and the arm's
+    /// exit killed this whole test binary (#1187). It now tests the arm's
+    /// decision, `lint_shell_status`, on inputs that run no linter: bare
+    /// `yoyo lint` would spawn cargo inside cargo and depend on the tree's
+    /// lint state. The linter-ran paths are covered against the built binary
+    /// by `lint_exits_with_the_linters_code_when_it_ran_and_failed`.
     #[test]
     fn test_try_dispatch_subcommand_lint() {
-        let args = vec!["yoyo".into(), "lint".into()];
-        let result = try_dispatch_subcommand(&args);
-        assert!(
-            matches!(result, Some(None)),
-            "expected Some(None) for bare `lint` subcommand"
+        let argv =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(|s| s.to_string()).collect() };
+        // Unknown subcommand: usage error (#1009).
+        assert_eq!(lint_shell_status(&argv(&["yoyo", "lint", "zz"])), 2);
+        // `lint fix` needs a live session: the shell-refusal code (#982).
+        assert_eq!(
+            lint_shell_status(&argv(&["yoyo", "lint", "fix"])),
+            crate::setup::SETUP_NOT_INTERACTIVE_EXIT
         );
+        // The door itself: a unit test that reaches it fails by name.
+        let reached = std::panic::catch_unwind(|| exit_if_nonzero(2));
+        let msg = reached.expect_err("the exit door must panic under cfg(test)");
+        let msg = msg.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("code 2") && msg.contains("#1187"), "{msg}");
+        // Code 0 is not an exit: the arm returns `Some(None)`.
+        exit_if_nonzero(0);
     }
 
     #[test]
@@ -2062,7 +2111,10 @@ mod tests {
         let args: Vec<String> = vec!["yoyo".into(), "docs".into()];
         let input = quote_args_as_command(&args);
         assert_eq!(input, "/docs");
-        assert_eq!(crate::commands_project::handle_docs_status(&input), 2);
+        assert_eq!(
+            crate::commands_project::handle_docs_status(&input, Shell),
+            2
+        );
     }
 
     #[test]

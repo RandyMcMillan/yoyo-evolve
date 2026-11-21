@@ -1004,7 +1004,8 @@ pub fn create_model_config(provider: &str, model: &str, base_url: Option<&str>) 
             let preset_id = crate::providers::openrouter_anthropic_preset_id(model);
             // #1122: a Claude id takes yoagent's sampling rule (4.7+ rejects
             // `temperature`), read off `ModelConfig::anthropic` when there is no
-            // preset. `ModelConfig::openai` above leaves the flag on for every id.
+            // preset. `ModelConfig::openai` above infers it from the id itself
+            // since yoagent 0.27.4 (#1152); this copy predates that and is kept.
             if let Some(id) = &preset_id {
                 config.accepts_sampling_params = anthropic_model_config(id).accepts_sampling_params;
             }
@@ -1139,16 +1140,24 @@ pub fn create_model_config(provider: &str, model: &str, base_url: Option<&str>) 
         }
         _ => {
             // Unknown provider — treat as OpenAI-compatible with custom base URL.
-            // Note: parse_args and /provider already warn about unknown names,
-            // but log here too as defense-in-depth for any future call sites.
+            // This is the only place that says so: parse_args refuses an unknown
+            // name only without a URL (#1103) and /provider refuses it outright,
+            // so the flag and .yoyo.toml doors reach only this line. It runs on
+            // every config build (5 per `-p hi`), hence once per pair (#1176).
             let url = base_url.unwrap_or("http://localhost:8080/v1");
-            eprintln!(
-                "{}warning:{} treating unknown provider '{}' as OpenAI-compatible ({})",
-                crate::format::YELLOW,
-                crate::format::RESET,
+            if crate::model_limits_note::first_unknown_limits_warning(
+                &WARNED_UNKNOWN_PROVIDERS,
                 provider,
-                url
-            );
+                url,
+            ) {
+                eprintln!(
+                    "{}warning:{} treating unknown provider '{}' as OpenAI-compatible ({})",
+                    crate::format::YELLOW,
+                    crate::format::RESET,
+                    provider,
+                    url
+                );
+            }
             let mut config = ModelConfig::local(url, model);
             config.provider = provider.to_string();
             config
@@ -1157,6 +1166,10 @@ pub fn create_model_config(provider: &str, model: &str, base_url: Option<&str>) 
     insert_client_headers(&mut config);
     config
 }
+
+/// `(provider, base_url)` pairs already warned about as unknown providers (#1176).
+static WARNED_UNKNOWN_PROVIDERS: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Factual grounding so the model doesn't confabulate a vendor identity when
 /// asked what it is. A model with no such context answers from training priors
@@ -1666,8 +1679,11 @@ impl AgentConfig {
             agent = agent.with_max_tokens(max);
         }
         // #1122: read off the config this agent was built from, never re-derived.
-        agent.temperature =
-            effective_temperature(&self.model, accepts_sampling_params, self.temperature);
+        agent.temperature = effective_temperature(
+            &self.model,
+            accepts_sampling_params,
+            self.provider_temperature(),
+        );
 
         // Checkpoint mode: register on_before_turn to stop when context gets high
         if self.context_strategy == cli::ContextStrategy::Checkpoint {
@@ -1728,7 +1744,7 @@ impl AgentConfig {
             let context_window = model_config.context_window;
             let output_ceiling =
                 declared_output_ceiling(&self.provider, &self.model, model_config.max_tokens);
-            // #1021: gemini ids with no preset run on google's 1M / 8192 guess.
+            // #1021: gemini ids with no yoagent preset guess (#1168: no yoyo table).
             crate::model_limits_note::warn_once_if_guessing(
                 &self.provider,
                 &self.model,
@@ -1755,7 +1771,13 @@ impl AgentConfig {
             );
             let sampling = model_config.accepts_sampling_params;
             let agent = Agent::from_provider(BedrockProvider, model_config);
-            self.configure_agent(agent, context_window, output_ceiling, sampling)
+            let mut agent = self.configure_agent(agent, context_window, output_ceiling, sampling);
+            // #1173/#1198: thinking off, a Claude id sends its preset maxTokens;
+            // thinking on, yoagent's rule alone (see `bedrock_max_tokens`).
+            let thinking_on = self.thinking != ThinkingLevel::Off;
+            agent.max_tokens =
+                crate::providers::bedrock_max_tokens(&self.model, self.max_tokens, thinking_on);
+            agent
         } else {
             // All other providers use OpenAI-compatible API
             let model_config = create_model_config(&self.provider, &self.model, base_url);
@@ -1846,9 +1868,20 @@ impl AgentConfig {
             // out of so all three builders carry one policy, not two.
             .with_execution_limits(ExecutionLimits::default().with_max_turns(1));
 
-        agent.temperature = effective_temperature(&self.model, sampling, self.temperature);
+        agent.temperature =
+            effective_temperature(&self.model, sampling, self.provider_temperature());
+        agent.max_tokens = self.thinking_off_max_tokens(&self.model);
 
         agent
+    }
+
+    /// #1203: the cap a thinking-off one-turn agent (/side, /architect) sends,
+    /// by the main agent's thinking-off rule: Bedrock's preset, else the user's.
+    fn thinking_off_max_tokens(&self, model: &str) -> Option<u32> {
+        match self.provider.as_str() {
+            "bedrock" => crate::providers::bedrock_max_tokens(model, self.max_tokens, false),
+            _ => self.max_tokens,
+        }
     }
 
     /// Build a minimal agent for the architect (planning) phase — same provider
@@ -1887,9 +1920,19 @@ impl AgentConfig {
             // out of so all three builders carry one policy, not two.
             .with_execution_limits(ExecutionLimits::default().with_max_turns(1));
 
-        agent.temperature = effective_temperature(architect_model, sampling, self.temperature);
+        agent.temperature =
+            effective_temperature(architect_model, sampling, self.provider_temperature());
+        agent.max_tokens = self.thinking_off_max_tokens(architect_model);
 
         agent
+    }
+
+    /// The configured temperature within this config's provider's bound
+    /// (#1207): a fallback or `/provider` switch to a 0–1 vendor gets at most
+    /// 1.0 even when the session started at 1.5 on a 0–2 one.
+    fn provider_temperature(&self) -> Option<f32> {
+        self.temperature
+            .map(|t| cli::clamped_temperature(&self.provider, t))
     }
 
     /// Build a full agent configured for the editor (implementation) phase.

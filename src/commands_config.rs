@@ -352,24 +352,13 @@ pub fn handle_config(cfg: &ConfigDisplay<'_>) {
 // a runtime mirror and `/config show` stays a file-introspection
 // tool. They're complementary, not redundant.
 
-/// Return `true` if a config key looks like a secret and its value
-/// should be masked in any user-visible output. Matches are
-/// case-insensitive substring checks against `key`, `token`, `secret`,
-/// and `password`. Keep this list in sync with anything that gets
-/// stored in `.yoyo.toml` as a sensitive value (e.g. API keys).
-pub(crate) fn is_secret_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower.contains("key")
-        || lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-}
+use crate::config_secret::is_masked_key;
 
 /// Pure, testable formatter for `/config show` output. Takes the
 /// already-loaded config HashMap and an optional path to the file
 /// it came from, and returns a stable, human-readable block.
 ///
-/// Secrets (keys matching `is_secret_key`) are always masked with
+/// Secrets and keys yoyo does not read (`is_masked_key`, #1199) are masked with
 /// `***` — the raw value must never appear in the output, even in
 /// debug builds. This is the whole point of the test below.
 ///
@@ -408,21 +397,23 @@ pub fn format_config_output(
     // pathological key doesn't throw off everything else.
     let max_key_len = config.keys().map(|k| k.len()).max().unwrap_or(0).min(24);
 
+    let run_provider = crate::commands_config_get::run_provider(config);
     let mut keys: Vec<&String> = config.keys().collect();
     keys.sort();
 
     out.push('\n');
     for key in keys {
         let value = config.get(key).map(String::as_str).unwrap_or("");
-        let display_value = if is_secret_key(key) {
+        let display_value = if is_masked_key(key) {
             "***".to_string()
         } else {
             value.to_string()
         };
         out.push_str(&format!(
-            "  {:<width$}  = {}\n",
+            "  {:<width$}  = {}{}\n",
             key,
             display_value,
+            crate::commands_config_get::unset_reading_note(key, value, &run_provider),
             width = max_key_len
         ));
     }
@@ -512,7 +503,18 @@ pub fn handle_config_show() -> bool {
     let config = match path.as_ref() {
         Some(p) => match crate::non_regular_read::read_regular_to_string(p) {
             Ok(content) => {
+                // #1184: a file that is not TOML is refused, not shown as guesses.
+                if let Some(msg) =
+                    crate::config::toml_parse_error(&p.display().to_string(), &content)
+                {
+                    eprintln!("{RED}error:{RESET} {msg}");
+                    return false;
+                }
                 crate::config_syntax::warn_config_syntax_once(&p.display().to_string(), &content);
+                crate::config_unknown_keys::warn_unknown_config_keys_once(
+                    &p.display().to_string(),
+                    &content,
+                );
                 crate::cli::parse_config_file(&content)
             }
             Err(e) => {
@@ -734,13 +736,14 @@ pub fn handle_config_set(input: &str, agent_config: &mut crate::AgentConfig, age
     };
 
     // Validate the value for this key
-    let canonical = match crate::config::validate_config_value(&key, &value) {
-        Ok(v) => v,
-        Err(msg) => {
-            println!("{RED}  {msg}{RESET}");
-            return;
-        }
-    };
+    let canonical =
+        match crate::config::validate_config_value_for(&key, &value, &agent_config.provider) {
+            Ok(v) => v,
+            Err(msg) => {
+                println!("{RED}  {msg}{RESET}");
+                return;
+            }
+        };
 
     // Write to disk. Capture the precedence chain BEFORE the write: after it,
     // a newly created file is already in the list, which is precisely what
@@ -853,12 +856,14 @@ fn apply_config_to_runtime(
 /// Shows the current runtime value for a single config key. REPL caller: the
 /// exit code is the shell's business only (#982).
 pub fn handle_config_get(input: &str) {
-    let _ = handle_config_get_status(input);
+    let _ = handle_config_get_status(input, crate::commands_dev::DoctorSurface::Repl);
 }
 
 /// [`handle_config_get`] plus the shell exit code (#982): 2 for a key that is
-/// neither settable nor in the file (misuse, like `yoyo model <bad>`), else 0.
-pub fn handle_config_get_status(input: &str) -> i32 {
+/// neither settable nor in the file (misuse, like `yoyo model <bad>`), or for
+/// no key at all (#1154, like `yoyo skill show`), else 0. `surface` spells
+/// the usage line, so the shell never reads `/config get` (#1155).
+pub fn handle_config_get_status(input: &str, surface: crate::commands_dev::DoctorSurface) -> i32 {
     let key = input
         .strip_prefix("/config get ")
         .or_else(|| input.strip_prefix("/config get"))
@@ -866,9 +871,8 @@ pub fn handle_config_get_status(input: &str) -> i32 {
         .trim();
 
     if key.is_empty() {
-        println!("{YELLOW}  usage: /config get <key>{RESET}");
-        println!("{DIM}  settable keys: {}{RESET}", settable_keys_list());
-        return 0;
+        eprint!("{}", crate::commands_config_get::config_get_usage(surface));
+        return 2;
     }
 
     // Read from the detected config file
@@ -876,7 +880,18 @@ pub fn handle_config_get_status(input: &str) -> i32 {
     let config = match path.as_ref() {
         Some(p) => match crate::non_regular_read::read_config_or_warn(p) {
             Some(content) => {
+                // #1184: a file that is not TOML is refused, not read as guesses.
+                if let Some(msg) =
+                    crate::config::toml_parse_error(&p.display().to_string(), &content)
+                {
+                    eprintln!("{RED}error:{RESET} {msg}");
+                    return crate::config_syntax::CONFIG_SYNTAX_REFUSAL_EXIT;
+                }
                 crate::config_syntax::warn_config_syntax_once(&p.display().to_string(), &content);
+                crate::config_unknown_keys::warn_unknown_config_keys_once(
+                    &p.display().to_string(),
+                    &content,
+                );
                 crate::cli::parse_config_file(&content)
             }
             None => std::collections::HashMap::new(),
@@ -889,6 +904,12 @@ pub fn handle_config_get_status(input: &str) -> i32 {
         .unwrap_or_else(|| "defaults".to_string());
     let (code, text) = config_get_report(key, &config, &source);
     print!("{text}");
+    if code == 0 {
+        print!(
+            "{}",
+            crate::commands_config_get::shadowed_key_note_on_disk(key, &config, path.as_deref())
+        );
+    }
     code
 }
 
@@ -1151,6 +1172,7 @@ pub fn handle_mcp(
 mod tests {
     use super::*;
     use crate::commands::{is_unknown_command, KNOWN_COMMANDS};
+    use crate::config_secret::is_secret_key;
     use serial_test::serial;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1877,7 +1899,7 @@ mod tests {
         // holds, and what the reader gives back.
         let (key, value, _) =
             parse_config_set_args(r#"/config set notify_command "notify-send \"done\"""#).unwrap();
-        let line = format!("{key} = {}", crate::config::format_toml_value(&value));
+        let line = crate::config::set_toml_key("", &key, &value).unwrap();
         let parsed = crate::config::parse_config_file(&line);
         assert_eq!(parsed.get("notify_command"), Some(&value));
     }

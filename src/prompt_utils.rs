@@ -40,15 +40,54 @@ pub fn write_output_file(path: &Option<String>, text: &str) -> std::io::Result<(
     let Some(path) = path else {
         return Ok(());
     };
+    // #1214: replacing is the decision (every `-o` replaces); saying so is the fix.
+    let existed = std::path::Path::new(path).exists();
     match std::fs::write(path, text) {
         Ok(()) => {
-            eprintln!("{DIM}  wrote response to {path}{RESET}");
+            eprintln!("{DIM}  {}{RESET}", output_file_note(path, existed));
             Ok(())
         }
         Err(e) => {
             eprintln!("{RED}  error writing to {path}: {e}{RESET}");
             Err(e)
         }
+    }
+}
+
+/// #1218: a failed run leaves the `--output` path exactly as it was (no
+/// replace, no create, like `curl -o`) and says so on stderr. #1220: an
+/// interrupted run (exit 130/143/129/131) too; `interrupted` picks the reason.
+pub fn skip_output_file_for_failed_run(path: &Option<String>, interrupted: bool) {
+    let Some(path) = path else {
+        return;
+    };
+    let existed = std::path::Path::new(path).exists();
+    eprintln!(
+        "{YELLOW}  {}{RESET}",
+        output_file_skipped_note(path, existed, interrupted)
+    );
+}
+
+/// The `--output` line for a failed (#1218) or interrupted (#1220) run.
+pub fn output_file_skipped_note(path: &str, existed: bool, interrupted: bool) -> String {
+    let why = if interrupted {
+        "the run was interrupted"
+    } else {
+        "the run failed"
+    };
+    if existed {
+        format!("{path} was not written: {why}, so the existing file was left as it was")
+    } else {
+        format!("{path} was not written: {why}, so no file was created")
+    }
+}
+
+/// The `--output` success line: "replaced" when the file existed before.
+pub fn output_file_note(path: &str, existed: bool) -> String {
+    if existed {
+        format!("replaced {path}")
+    } else {
+        format!("wrote response to {path}")
     }
 }
 
@@ -544,6 +583,47 @@ mod tests {
             "a write to a nonexistent directory must return Err, not be swallowed"
         );
         assert!(!path.exists(), "no file should have been created");
+    }
+
+    /// #1214: `--output` replaces an existing file by decision (every `-o`
+    /// does: curl, wget, sort, gcc, shell `>`), and says so instead of
+    /// "wrote", so the replacement is never silent.
+    #[test]
+    fn write_output_file_replaces_an_existing_file_and_says_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        std::fs::write(&path, "keep me").unwrap();
+        let p = path.to_string_lossy().to_string();
+        write_output_file(&Some(p.clone()), "answer").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "answer");
+        assert_eq!(output_file_note(&p, true), format!("replaced {p}"));
+        assert_eq!(
+            output_file_note(&p, false),
+            format!("wrote response to {p}")
+        );
+    }
+
+    /// #1218: the failed-run line names the path and says which of the two
+    /// untouched states it is in.
+    #[test]
+    fn output_file_skipped_note_names_the_path_and_the_untouched_state() {
+        assert_eq!(
+            output_file_skipped_note("a.md", true, false),
+            "a.md was not written: the run failed, so the existing file was left as it was"
+        );
+        assert_eq!(
+            output_file_skipped_note("a.md", false, false),
+            "a.md was not written: the run failed, so no file was created"
+        );
+        // #1220: the interrupted reason.
+        assert_eq!(
+            output_file_skipped_note("a.md", true, true),
+            "a.md was not written: the run was interrupted, so the existing file was left as it was"
+        );
+        assert_eq!(
+            output_file_skipped_note("a.md", false, true),
+            "a.md was not written: the run was interrupted, so no file was created"
+        );
     }
 
     #[test]

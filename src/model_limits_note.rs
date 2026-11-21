@@ -7,8 +7,9 @@
 //! reasoning plus answer on every turn and used to say nothing. This module
 //! does not invent limits for unknown ids (there is no source for them); it
 //! makes the fallback say what it is assuming. `AgentConfig::build_agent`'s
-//! OpenAI-compatible and google branches are the consumers (google since
-//! Day 238, #1021, when membership moved from values to provenance).
+//! arms are the consumers: OpenAI-compatible, google (since Day 238, #1021,
+//! when membership moved from values to provenance), anthropic and bedrock
+//! (since Day 241).
 
 /// Providers whose server the user runs and configures themselves, so their
 /// limits are the user's to set there: never warned about, though
@@ -29,9 +30,11 @@ const PROBE_IDS: [&str; 2] = ["zz-unknown-a", "zz-unknown-b"];
 /// silent. Unknown providers are never resolved here.
 pub(crate) fn runs_on_guessed_limits(provider: &str, model: &str) -> bool {
     use crate::agent_builder::{create_model_config, declared_output_ceiling, vendor_preset};
-    if !crate::providers::KNOWN_PROVIDERS.contains(&provider)
-        || USER_RUN_SERVER_PROVIDERS.contains(&provider)
-    {
+    // A retired name (#1166) is unlisted but still runs with a base URL, on
+    // its own arm's guessed limits, so it keeps the note.
+    let resolvable = crate::providers::KNOWN_PROVIDERS.contains(&provider)
+        || crate::providers::retired_provider_refusal(provider).is_some();
+    if !resolvable || USER_RUN_SERVER_PROVIDERS.contains(&provider) {
         return false;
     }
     let limits = |id: &str| {
@@ -60,7 +63,9 @@ const UNKNOWN_MODEL_ID_MAX_BYTES: usize = 200;
 /// the user set `max_tokens` themselves (`user_max_tokens`: they chose, do not
 /// nag), or [`runs_on_guessed_limits`] is false. When the user set
 /// `context_window` but not `max_tokens`, only the output cap is reported,
-/// because claiming a guessed window would be false.
+/// because claiming a guessed window would be false. On google and bedrock
+/// (#1158, #1160) the guessed `max_tokens` is never sent, so the note says
+/// no output cap goes out instead of naming one.
 ///
 /// The id is user/config-authored, so it is sanitized and capped on a char
 /// boundary with an ASCII marker. Glyph-free (pure ASCII apart from the id's
@@ -85,6 +90,44 @@ pub(crate) fn unknown_model_limits_note(
         shown
     };
     let marker = if plain { "warning: " } else { "⚠ " };
+    // #1158: GoogleProvider sends `maxOutputTokens` only from a user cap
+    // (observed in tests/google_max_tokens_request.rs: no `generationConfig`
+    // at all without one), so the 8192 guess in ModelConfig never goes
+    // out and "capped at {max_tokens}" would be false for google.
+    // #1160: BedrockProvider likewise sets `inferenceConfig.maxTokens` only
+    // from a user cap with thinking off (tests/bedrock_max_tokens_request.rs
+    // row (a): no `inferenceConfig` at all), so bedrock's 16000 guess is held.
+    // #1198: with thinking on, yoagent 0.27.9 falls back to that guess and
+    // sends it (raised above the budget if needed; row (g)), so the bedrock
+    // sentence names both cases. The window guess IS used (compaction).
+    let vendor = match provider {
+        "google" => Some("Google"),
+        "bedrock" => Some("Bedrock"),
+        _ => None,
+    };
+    if let Some(vendor) = vendor {
+        let when = if provider == "bedrock" {
+            format!(
+                "With thinking off, yoyo sends no output cap, so {vendor} applies the model's own \
+default output limit; with thinking on, the guessed max_tokens = {max_tokens} goes out as the cap \
+(raised above the thinking budget if it is not already above it)"
+            )
+        } else {
+            format!("yoyo sends no output cap, so {vendor} applies the model's own default output limit")
+        };
+        let no_cap =
+            format!("{when}; set max_tokens in .yoyo.toml (or pass --max-tokens) to cap replies");
+        return Some(match user_context_window {
+            Some(_) => {
+                format!("{marker}no preset is known for {provider} model '{shown}'. {no_cap}.")
+            }
+            None => format!(
+                "{marker}no preset is known for {provider} model '{shown}', so yoyo is using a \
+guessed {window}-token context window. {no_cap}, and context_window (or --context-window) if \
+the model's window differs."
+            ),
+        });
+    }
     let assumed = match user_context_window {
         Some(_) => format!("max_tokens = {max_tokens}"),
         None => format!("a {window}-token context window and max_tokens = {max_tokens}"),
@@ -244,37 +287,78 @@ context_window in .yoyo.toml (or pass --max-tokens / --context-window)."
         assert!(out.contains(&format!("max_tokens = {max}")), "{out}");
     }
 
-    /// #1021, Day 238: the four gemini-2.x ids on google's known list have no
-    /// preset, so `ModelConfig::google` hands them its per-id-agnostic guess
-    /// (1M window, max_tokens 8192). They warn with the numbers they really run
-    /// on, read from the resolver, never typed here.
+    /// #1021, Day 238: a gemini id with no preset gets `ModelConfig::google`'s
+    /// per-id-agnostic guess (1M window, max_tokens 8192) and warns with the
+    /// numbers it really runs on, read from the resolver, never typed here.
+    /// #1157: the offered 2.5 ids now carry Google's published limits, so the
+    /// guessing rows are ids Google does not list.
     #[test]
     fn google_ids_on_the_guess_warn_and_preset_ids_stay_silent() {
         let probe = create_model_config("google", PROBE_IDS[0], None);
-        for id in [
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ] {
+        for id in ["gemini-zzz", "gemini-3.0-pro", "gemini-2.0-flash"] {
             let out = note_for("google", id, true).unwrap_or_else(|| panic!("{id} must warn"));
+            // #1158: the wire carries no maxOutputTokens without a user cap
+            // (tests/google_max_tokens_request.rs), so the note names the
+            // window guess and says no cap is sent, never "capped at 8192".
             assert_eq!(
                 out,
                 format!(
                     "warning: no preset is known for google model '{id}', so yoyo is using \
-guessed limits: a {w}-token context window and max_tokens = {m}. Every reply (reasoning \
-included) is capped at {m} output tokens. If the model allows more, set max_tokens and \
-context_window in .yoyo.toml (or pass --max-tokens / --context-window).",
+a guessed {w}-token context window. yoyo sends no output cap, so Google applies the model's own \
+default output limit; set max_tokens in .yoyo.toml (or pass --max-tokens) to cap replies, and \
+context_window (or --context-window) if the model's window differs.",
                     w = probe.context_window,
-                    m = probe.max_tokens
                 )
             );
+            assert!(!out.contains(&probe.max_tokens.to_string()), "{out}");
         }
+        // With the window set by the user, nothing is guessed that reaches
+        // the wire or the budget's window, but the "no cap is sent" fact
+        // still holds and is the whole note.
+        let out = unknown_model_limits_note(
+            "google",
+            "gemini-zzz",
+            probe.context_window,
+            probe.max_tokens,
+            None,
+            Some(500_000),
+            true,
+        )
+        .expect("google no-cap note still applies");
+        assert_eq!(
+            out,
+            "warning: no preset is known for google model 'gemini-zzz'. yoyo sends no output \
+cap, so Google applies the model's own default output limit; set max_tokens in .yoyo.toml (or \
+pass --max-tokens) to cap replies."
+        );
+        // Near-miss: a non-google arm on a guess keeps the "capped at"
+        // sentence (openai-compat sends ModelConfig.max_tokens as its
+        // fallback, yoagent openai_compat.rs:431; read, not observed here).
+        let out = note_for("openrouter", "vendor/some-model", true).unwrap();
+        assert!(
+            out.contains("Every reply (reasoning included) is capped at"),
+            "{out}"
+        );
         // Near-miss: the current google default has a vendor preset.
         assert_eq!(note_for("google", "gemini-3.8-flash", true), None);
         assert_eq!(note_for("google", "gemini-4-argon", true), None);
+        // #1168: flash-lite is a yoagent preset since 0.27.7, not a guess.
+        assert_eq!(note_for("google", "gemini-2.5-flash-lite", true), None);
         // Anthropic default (fleet preset) stays silent.
         assert_eq!(note_for("anthropic", "claude-opus-5-5", true), None);
+    }
+
+    /// #1166: `github` is unlisted, but `--provider github --base-url X` still
+    /// runs through its own arm on guessed limits, so the note must still fire;
+    /// a name that is neither listed nor retired stays unresolved.
+    #[test]
+    fn retired_provider_with_a_base_url_still_warns_on_guessed_limits() {
+        assert!(!crate::providers::KNOWN_PROVIDERS.contains(&"github"));
+        assert!(runs_on_guessed_limits("github", "some-model"));
+        assert!(note_for("github", "some-model", true).is_some());
+        // Near-miss: an unknown name is not resolved here (its own warning says
+        // "treating unknown provider ... as OpenAI-compatible").
+        assert!(!runs_on_guessed_limits("nosuch", "some-model"));
     }
 
     /// Anti-vacuous premise of the provenance check: for every provider the
@@ -292,7 +376,7 @@ context_window in .yoyo.toml (or pass --max-tokens / --context-window).",
             );
         }
         let g = create_model_config("google", PROBE_IDS[0], None);
-        let flash = create_model_config("google", "gemini-2.5-flash", None);
+        let flash = create_model_config("google", "gemini-3.0-flash", None);
         assert_eq!(
             (g.context_window, g.max_tokens),
             (flash.context_window, flash.max_tokens)
@@ -337,7 +421,6 @@ context_window in .yoyo.toml (or pass --max-tokens / --context-window).",
             "anthropic",
             "bedrock",
             "cerebras",
-            "github",
             "google",
             "groq",
             "minimax",
@@ -349,6 +432,62 @@ context_window in .yoyo.toml (or pass --max-tokens / --context-window).",
         ];
         expected.sort_unstable();
         assert_eq!(guessing, expected);
+    }
+
+    /// #1160 (Day 255): with thinking off, BedrockProvider sends
+    /// `inferenceConfig.maxTokens` only from a user cap; with none the Converse
+    /// body has no `inferenceConfig` at all (row (a) of
+    /// tests/bedrock_max_tokens_request.rs). #1198 (yoagent 0.27.9): with
+    /// thinking on it falls back to the guessed 16000 and sends it (row (g)).
+    /// So the note names both cases, and the wire test fails if either drifts.
+    #[test]
+    fn bedrock_note_names_the_window_and_the_cap_per_thinking_state() {
+        let c = create_model_config("bedrock", "amazon.nova-pro-v1:0", None);
+        assert_eq!((c.context_window, c.max_tokens), (200_000, 16_000));
+        assert_eq!(
+            note_for("bedrock", "amazon.nova-pro-v1:0", true).as_deref(),
+            Some(
+                "warning: no preset is known for bedrock model 'amazon.nova-pro-v1:0', so yoyo \
+is using a guessed 200000-token context window. With thinking off, yoyo sends no output cap, so \
+Bedrock applies the model's own default output limit; with thinking on, the guessed max_tokens = \
+16000 goes out as the cap (raised above the thinking budget if it is not already above it); set \
+max_tokens in .yoyo.toml (or pass --max-tokens) to cap replies, and context_window (or \
+--context-window) if the model's window differs."
+            )
+        );
+        // With the window set by the user, only the cap facts remain.
+        assert_eq!(
+            unknown_model_limits_note(
+                "bedrock",
+                "amazon.nova-pro-v1:0",
+                c.context_window,
+                c.max_tokens,
+                None,
+                Some(300_000),
+                true,
+            )
+            .as_deref(),
+            Some(
+                "warning: no preset is known for bedrock model 'amazon.nova-pro-v1:0'. With \
+thinking off, yoyo sends no output cap, so Bedrock applies the model's own default output limit; \
+with thinking on, the guessed max_tokens = 16000 goes out as the cap (raised above the thinking \
+budget if it is not already above it); set max_tokens in .yoyo.toml (or pass --max-tokens) to cap \
+replies."
+            )
+        );
+        // A user cap silences it (that cap IS sent, row (b) of the wire test).
+        assert_eq!(
+            unknown_model_limits_note(
+                "bedrock",
+                "amazon.nova-pro-v1:0",
+                c.context_window,
+                1234,
+                Some(1234),
+                None,
+                true,
+            ),
+            None
+        );
     }
 
     /// Consumer-side register (#1037, Day 231): which providers' OWN built-in
@@ -380,7 +519,9 @@ context_window in .yoyo.toml (or pass --max-tokens / --context-window).",
         // (shrank by exactly those three). The four left carry their reason
         // in `providers.rs`'s `DEFAULT_WITHOUT_PRESET`: yoagent ships no
         // preset for any of their ids.
-        let mut expected = vec!["groq", "github", "cerebras", "minimax"];
+        // #1166: `github` left with GitHub Models' retirement; it has no
+        // default now (see retired_provider_with_a_base_url_still_warns...).
+        let mut expected = vec!["groq", "cerebras", "minimax"];
         expected.sort_unstable();
         assert_eq!(
             tripping, expected,

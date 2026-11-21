@@ -15,9 +15,23 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "zai",
     "minimax",
     "bedrock",
-    "github",
     "custom",
 ];
+
+/// Providers yoyo still recognises by name but lists nowhere (#1166), each with
+/// the refusal shown when one is picked without a base URL. With a base URL the
+/// name still runs, against the endpoint the user named: `create_model_config`
+/// keeps a `github` arm for exactly that. Not in [`KNOWN_PROVIDERS`], so no
+/// list, completion, hint or default reads them.
+pub const RETIRED_PROVIDERS: &[(&str, &str)] = &[("github", GITHUB_MODELS_RETIRED)];
+
+/// The refusal for a [retired](RETIRED_PROVIDERS) provider, or `None`.
+pub fn retired_provider_refusal(provider: &str) -> Option<&'static str> {
+    RETIRED_PROVIDERS
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, msg)| *msg)
+}
 
 /// Get the environment variable name that holds the API key for a provider.
 pub fn provider_api_key_env(provider: &str) -> Option<&'static str> {
@@ -34,7 +48,6 @@ pub fn provider_api_key_env(provider: &str) -> Option<&'static str> {
         "minimax" => Some("MINIMAX_API_KEY"),
         "bedrock" => Some("AWS_ACCESS_KEY_ID"),
         "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "github" => Some("GITHUB_TOKEN"),
         _ => None,
     }
 }
@@ -58,8 +71,6 @@ pub fn provider_api_key_vars(provider: &str) -> &'static [&'static str] {
         "minimax" => &["MINIMAX_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "cerebras" => &["CEREBRAS_API_KEY"],
-        // yoyo-own: yoagent has no github provider; GitHub Models takes a GitHub token.
-        "github" => &["GITHUB_TOKEN"],
         // yoyo-own: main.rs `apply_bedrock_credentials` joins this access key with
         // AWS_SECRET_ACCESS_KEY; yoagent's bearer-token name would be misjoined there.
         "bedrock" => &["AWS_ACCESS_KEY_ID"],
@@ -69,7 +80,7 @@ pub fn provider_api_key_vars(provider: &str) -> &'static [&'static str] {
 
 /// The provider's own key from `lookup`, trying `provider_api_key_vars` in
 /// order; empty values count as unset. `None` sends the caller to its
-/// `ANTHROPIC_API_KEY` > `API_KEY` fallback.
+/// generic `API_KEY` fallback (never `ANTHROPIC_API_KEY` for another provider, #1170).
 pub fn find_provider_key(
     provider: &str,
     lookup: impl Fn(&str) -> Option<String>,
@@ -123,13 +134,20 @@ pub fn known_models_for_provider(provider: &str) -> &'static [&'static str] {
             "o3-mini",
             "o4-mini",
         ],
+        // #1118: every id here is a yoagent preset or on Google's models page
+        // (`every_offered_gemini_id_is_a_yoagent_preset_or_on_googles_page`).
+        // #1162: 2.5 Pro/Flash are not offered (deprecated, closed to new
+        // users, rerouted 2026-12-01: see IDS_NO_VENDOR_SERVES); current ids
+        // come first so the warning's five name them.
         "google" => &[
             "gemini-4-argon",
             "gemini-3.8-flash",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
+            "gemini-3.6-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
             "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
         ],
         "groq" => &[
             "llama-4-maverick-17b",
@@ -161,22 +179,12 @@ pub fn known_models_for_provider(provider: &str) -> &'static [&'static str] {
         ],
         "bedrock" => &[
             "anthropic.claude-sonnet-4-6",
-            "anthropic.claude-opus-4-7",
+            "anthropic.claude-opus-5-5",
             "anthropic.claude-haiku-4-5-20251001-v1:0",
             "amazon.nova-pro-v1:0",
             "amazon.nova-lite-v1:0",
         ],
         "ollama" => &["llama3.2", "llama3.1", "codellama", "mistral"],
-        "github" => &[
-            "openai/gpt-4o",
-            "openai/gpt-4o-mini",
-            "openai/o3-mini",
-            "openai/o4-mini",
-            "meta/llama-4-scout-17b-16e-instruct",
-            "mistral/mistral-large-latest",
-            "deepseek/deepseek-v4-pro",
-            "anthropic/claude-sonnet-4-6",
-        ],
         _ => &[],
     }
 }
@@ -224,6 +232,31 @@ pub(crate) fn openrouter_routed_preset(model: &str) -> Option<yoagent::provider:
         (p.id, p.name) = (model.to_string(), model.to_string());
         Some(p)
     })
+}
+
+/// The `max_tokens` a Bedrock agent sends (#1173, #1198): one rule per
+/// thinking state, never two computing the same cell.
+///
+/// Thinking on: yoagent 0.27.9's `build_bedrock_body` is the only rule. It
+/// sends the request's cap, else the `ModelConfig`'s (the preset's output
+/// maximum for a Claude id, the 16000 guess otherwise), raised to budget +
+/// 1024 when not above the budget, so this returns just the user's cap.
+///
+/// Thinking off: yoagent sends only an explicit cap, so this is the only
+/// rule. For an id yoagent's Bedrock preset covers (a Claude id) it returns
+/// the preset's output maximum: the length a reply may reach then does not
+/// depend on the thinking level (with thinking on yoagent sends that same
+/// value), it matches what yoagent's first-party Anthropic path sends, and an
+/// omitted `maxTokens` is left to a Bedrock default AWS documents as the model
+/// maximum and one third-party report (litellm) saw as 4096. The cost: Bedrock
+/// reserves that cap against the account's tokens-per-minute quota while a
+/// request runs. An id with no preset keeps no cap, as `model_limits_note`
+/// tells the user. A user cap is returned as given in both states.
+pub(crate) fn bedrock_max_tokens(model: &str, user: Option<u32>, thinking_on: bool) -> Option<u32> {
+    if thinking_on {
+        return user;
+    }
+    user.or_else(|| yoagent::provider::ModelConfig::preset("bedrock", model).map(|p| p.max_tokens))
 }
 
 /// Whether `model` is a **known** id for `provider`.
@@ -355,9 +388,6 @@ pub fn default_model_for_provider(provider: &str) -> String {
         // default runs on guessed limits and says so (#1119, `DEFAULT_WITHOUT_PRESET`).
         "minimax" => "MiniMax-M2.7".into(),
         "bedrock" => "anthropic.claude-sonnet-4-6".into(),
-        // No preset by necessity: yoagent ships none for any github id, so the
-        // default runs on guessed limits and says so (#1119, `DEFAULT_WITHOUT_PRESET`).
-        "github" => "openai/gpt-4o".into(),
         // The anthropic (and unknown-provider) default is `claude-opus-5-5` by
         // decision, checked Day 230 (#1037) rather than picked as "newest": it has
         // a yoagent preset (`anthropic_preset`, most-specific arm) with bundled
@@ -383,7 +413,14 @@ pub fn default_model_for_provider(provider: &str) -> String {
 /// `commands::closest_match`; otherwise the known list. The name is
 /// sanitized (a project `.yoyo.toml` is repository-authored). Glyph-free
 /// except the em dash; callers add colour.
+///
+/// Also refuses a [retired](RETIRED_PROVIDERS) provider without a base URL
+/// (`github`: GitHub Models, see [`GITHUB_MODELS_RETIRED`]), before the
+/// unknown-name branch, so the reason is the retirement, not "unknown".
 pub fn unknown_provider_refusal(provider: &str, base_url_given: bool) -> Option<String> {
+    if let Some(msg) = retired_provider_refusal(provider).filter(|_| !base_url_given) {
+        return Some(msg.to_string());
+    }
     if KNOWN_PROVIDERS.contains(&provider) || base_url_given {
         return None;
     }
@@ -400,13 +437,71 @@ pub fn unknown_provider_refusal(provider: &str, base_url_given: bool) -> Option<
     Some(msg)
 }
 
+/// #1175: true when `provider` is a user-run OpenAI-compatible server whose
+/// models yoyo cannot know: `custom`, or any name outside [`KNOWN_PROVIDERS`]
+/// (which `unknown_provider_refusal` lets through only with a base URL). For
+/// these, `default_model_for_provider` has no honest answer (its `_` arm is an
+/// Anthropic id), so a run with no model named refuses instead of guessing.
+/// `ollama` is not here: its default `llama3.2` is a model ollama serves.
+pub fn provider_requires_named_model(provider: &str) -> bool {
+    provider == "custom" || !KNOWN_PROVIDERS.contains(&provider)
+}
+
+/// Where `custom` (and an unknown provider) send requests with no base URL:
+/// a copy of `create_model_config`'s fallback in agent_builder.rs, pinned to
+/// it by `named_model_refusal_default_url_is_create_model_configs`.
+const LOCAL_SERVER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+
+/// #1175: `Some(refusal)` when `provider` [requires a named
+/// model](provider_requires_named_model) and `model` (the `--model` flag or
+/// config `model`, already trimmed; `None` when neither names one) is absent.
+/// `base_url` is the user's; the listing hint is `<base_url>/models`, the
+/// OpenAI-compatible model list, so the user can see which ids their server has.
+pub fn named_model_required_refusal(
+    provider: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
+) -> Option<String> {
+    if model.is_some() || !provider_requires_named_model(provider) {
+        return None;
+    }
+    let shown = crate::cli::sanitize_for_display(provider);
+    let url = base_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(LOCAL_SERVER_DEFAULT_URL)
+        .trim_end_matches('/');
+    let url = crate::cli::sanitize_for_display(url);
+    Some(format!(
+        "provider '{shown}' needs a model name: yoyo cannot know which models your \
+server at {url} serves, so it does not guess one\n\
+name the model with: --model <id>   (or model = \"<id>\" in .yoyo.toml)\n\
+to list the ids your server serves: curl {url}/models"
+    ))
+}
+
+/// #1166: GitHub retired GitHub Models on 2026-07-30, and every path on
+/// models.github.ai now answers `200 text/plain "OK"`, which surfaced as an
+/// opaque `Invalid header value: "text/plain"`. So `github` with no base URL
+/// is refused up front with the reason. With `--base-url` (or `base_url` in
+/// config) it still runs: the user chose an endpoint, and yoyo sends there.
+/// It is in [`RETIRED_PROVIDERS`], not [`KNOWN_PROVIDERS`]: no list offers it,
+/// and it has no key variable, default model or known-model list (#1166).
+pub const GITHUB_MODELS_RETIRED: &str = "provider 'github' (GitHub Models) was retired by GitHub \
+on 2026-07-30 and no longer answers requests \
+(https://github.blog/changelog/2026-07-30-github-models-is-now-retired)\n\
+for the same model families use: --provider openrouter\n\
+for an OpenAI-compatible server use: --provider custom --base-url <url>";
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// #1147 (Day 251): ids yoyo used to offer that no vendor serves, each with
-    /// the page that says so (all read 2026-11-06). Kept as a register so a
-    /// later session re-adding one from memory fails here, by name.
+    /// the page that says so (read 2026-11-06 unless the row dates its own read).
+    /// #1162 adds ids a vendor still serves to existing users only, on a dated
+    /// reroute: not offered to new users, who would be refused. Kept as a
+    /// register so a later session re-adding one from memory fails here, by name.
     const IDS_NO_VENDOR_SERVES: &[(&str, &str, &str)] = &[
         (
             "openai",
@@ -437,7 +532,85 @@ mod tests {
             "not an API id: platform.minimax.io/docs/api-reference/text-post names \
              MiniMax-M1, never -40k",
         ),
+        (
+            "google",
+            "gemini-2.0-flash",
+            "shut down: ai.google.dev/gemini-api/docs/models lists it under Previous \
+             models as '(Shut down)' (read 2026-11-08, #1118)",
+        ),
+        (
+            "google",
+            "gemini-2.5-pro",
+            "deprecated, closed to new users, rerouted: ai.google.dev/gemini-api/docs/deprecations \
+             (read 2026-11-09, #1162): 'Access through the API is limited to existing users who \
+             have actively used it in the past. Effective December 1, 2026, all API requests to \
+             gemini-2.5-pro will automatically route to gemini-3.8-flash'",
+        ),
+        (
+            "google",
+            "gemini-2.5-flash",
+            "deprecated, closed to new users, rerouted: ai.google.dev/gemini-api/docs/deprecations \
+             (read 2026-11-09, #1162): 'Access to the 2.5 models is limited to users who have \
+             actively used them in the past', and 'effective December 1, 2026, API requests to \
+             gemini-2.5-flash will automatically route to gemini-3.5-flash-lite'",
+        ),
+        (
+            "google",
+            "gemini-3.0-pro",
+            "not an API id: absent from ai.google.dev/gemini-api/docs/models (read \
+             2026-11-08); Google's ids are gemini-3-pro-preview (shut down) and 3.1-pro-preview",
+        ),
+        (
+            "google",
+            "gemini-3.0-flash",
+            "not an API id: absent from ai.google.dev/gemini-api/docs/models (read \
+             2026-11-08); Google's id is gemini-3-flash-preview",
+        ),
     ];
+
+    /// A yoagent preset or bundled price row for `google`/`id`.
+    fn yoagent_knows_gemini(id: &str) -> bool {
+        yoagent::provider::ModelConfig::preset("google", id).is_some()
+            || yoagent::provider::PriceTable::builtin()
+                .iter()
+                .any(|(p, model, _)| p == "google" && model == id)
+    }
+
+    /// #1118: a Gemini id on the picker or the known list silences the
+    /// `Unknown model` warning, so each one needs an outside source: a yoagent
+    /// preset whose limits are real, not `ModelConfig::google`'s 1,000,000 /
+    /// 8192 guess. `gemini-3.0-pro` (offered from memory, never a Google id)
+    /// would fail here by name. #1168 (Day 254): yoagent 0.27.7 presets cover
+    /// every offered id, so yoyo's own Google-page table is gone.
+    #[test]
+    fn every_offered_gemini_id_is_a_yoagent_preset_with_real_limits() {
+        let guess = yoagent::provider::ModelConfig::google("zz", "zz");
+        let picker = crate::commands::KNOWN_MODELS
+            .iter()
+            .filter(|id| id.starts_with("gemini-"));
+        for id in known_models_for_provider("google").iter().chain(picker) {
+            let preset = yoagent::provider::ModelConfig::preset("google", id)
+                .unwrap_or_else(|| panic!("google offers {id}: no yoagent preset"));
+            assert!(yoagent_knows_gemini(id), "{id}");
+            assert_ne!(
+                (preset.context_window, preset.max_tokens),
+                (guess.context_window, guess.max_tokens),
+                "{id}: the preset carries ModelConfig::google's guess, not real limits"
+            );
+        }
+        // Every offered id's window: 1,048,576 on each id's Google page.
+        for id in known_models_for_provider("google") {
+            assert_eq!(
+                crate::commands_info::model_context_window(id),
+                Some(1_048_576),
+                "{id}"
+            );
+        }
+        // Recall control: the dead ids really fail the authority.
+        for dead in ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.0-flash"] {
+            assert!(!yoagent_knows_gemini(dead), "{dead} must fail");
+        }
+    }
 
     #[test]
     fn ids_no_vendor_serves_are_not_offered_and_warn_when_typed() {
@@ -471,6 +644,8 @@ mod tests {
             ("minimax", "MiniMax-M1"),
             ("groq", "llama-3.3-70b-versatile"),
             ("xai", "grok-4.7"),
+            ("google", "gemini-3.1-pro-preview"),
+            ("google", "gemini-3-flash-preview"),
         ] {
             assert_eq!(crate::cli::unknown_model_warning(provider, real), None);
         }
@@ -488,7 +663,6 @@ mod tests {
         ("groq", "yoagent ships no preset for any groq id, so no default could resolve through one"),
         ("cerebras", "yoagent ships no preset for any cerebras id, so no default could resolve through one"),
         ("minimax", "yoagent ships no preset for any minimax id, so no default could resolve through one"),
-        ("github", "yoagent ships no preset for any github-models id, so no default could resolve through one"),
     ];
 
     #[test]
@@ -594,6 +768,31 @@ mod tests {
         );
         // Anti-vacuous: the list really is the authority, not an empty join.
         assert!(first.contains("anthropic") && first.contains("custom"));
+        // #1166: the list a user is told to pick from never offers a retired
+        // provider, and still names every listed one.
+        for (retired, _) in RETIRED_PROVIDERS {
+            assert!(!msg.contains(retired), "offers retired {retired}: {msg}");
+        }
+        for p in KNOWN_PROVIDERS {
+            assert!(first.contains(p), "{p} missing: {first}");
+        }
+    }
+
+    #[test]
+    fn retired_github_provider_is_refused_with_the_retirement_named() {
+        let msg = unknown_provider_refusal("github", false).expect("github must be refused");
+        assert_eq!(msg, GITHUB_MODELS_RETIRED);
+        assert!(msg.contains("retired"), "{msg}");
+        assert!(msg.contains("2026-07-30"), "{msg}");
+        assert!(msg.contains("--provider openrouter"), "{msg}");
+        assert!(msg.contains("--provider custom --base-url <url>"), "{msg}");
+        // Near-misses: an explicit endpoint is a choice; other providers untouched.
+        assert_eq!(unknown_provider_refusal("github", true), None);
+        assert_eq!(unknown_provider_refusal("openai", false), None);
+        // `github` is no longer listed (#1166), so the retirement branch must
+        // run before the unknown-name one, or the user reads "unknown provider".
+        assert!(!KNOWN_PROVIDERS.contains(&"github"));
+        assert!(!msg.contains("unknown provider"), "{msg}");
     }
 
     #[test]
@@ -897,12 +1096,61 @@ mod tests {
         );
     }
 
+    /// #1173: the cap sent (`bedrock_max_tokens`) and the guessed-limits note
+    /// (a limits fingerprint) are two resolvers over one question. They must
+    /// agree: an id that gets a preset cap is not warned about, and an id
+    /// that is warned about ("yoyo sends no output cap") really sends none,
+    /// with thinking off. With thinking on yoyo sets no default at all and
+    /// yoagent's rule decides (#1198; the note's thinking-on clause and the
+    /// wire are pinned in tests/bedrock_max_tokens_request.rs rows (c), (f), (g)).
     #[test]
-    fn test_bedrock_known_models_includes_new_variants() {
+    fn bedrock_preset_cap_and_guessed_limits_note_agree() {
+        let mut ids: Vec<String> = known_models_for_provider("bedrock")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        ids.extend(["amazon.nova-pro-v1:0", "us.anthropic.claude-sonnet-4-6"].map(String::from));
+        ids.push("xx.anthropic.claude-sonnet-4-6".into());
+        let mut capped = 0;
+        for id in &ids {
+            let cap = bedrock_max_tokens(id, None, false);
+            // Thinking on: yoyo leaves the cap to yoagent's rule (#1198).
+            assert_eq!(bedrock_max_tokens(id, None, true), None, "{id}");
+            let warned = crate::model_limits_note::runs_on_guessed_limits("bedrock", id);
+            assert_ne!(cap.is_some(), warned, "{id}: cap {cap:?}, warned {warned}");
+            capped += usize::from(cap.is_some());
+        }
+        // Both branches are populated, so the agreement is not vacuous.
+        assert!(
+            capped > 0 && capped < ids.len(),
+            "{capped} of {}",
+            ids.len()
+        );
+        assert_eq!(
+            bedrock_max_tokens("amazon.nova-pro-v1:0", Some(77), false),
+            Some(77)
+        );
+        assert_eq!(
+            bedrock_max_tokens("anthropic.claude-sonnet-4-6", Some(77), true),
+            Some(77)
+        );
+    }
+
+    #[test]
+    /// #1121: the Bedrock list offers an Opus that yoagent maps to a Bedrock
+    /// preset (opus-5-5), not opus-4-7, which yoagent 0.27.9's Bedrock table
+    /// lacks and so ran on guessed limits. The flip from "includes opus-4-7"
+    /// is that behaviour change; the class rule is
+    /// `every_listed_bedrock_claude_id_resolves_a_yoagent_bedrock_preset`.
+    fn test_bedrock_known_models_offer_a_preset_backed_opus_not_opus_4_7() {
         let models = known_models_for_provider("bedrock");
         assert!(
-            models.contains(&"anthropic.claude-opus-4-7"),
-            "bedrock should include anthropic.claude-opus-4-7"
+            models.contains(&"anthropic.claude-opus-5-5"),
+            "bedrock should include anthropic.claude-opus-5-5"
+        );
+        assert!(
+            !models.contains(&"anthropic.claude-opus-4-7"),
+            "bedrock must not offer anthropic.claude-opus-4-7 (no yoagent Bedrock preset)"
         );
         assert!(
             models.contains(&"anthropic.claude-sonnet-4-6"),
@@ -940,32 +1188,41 @@ mod tests {
         );
     }
 
+    /// #1166: GitHub Models is retired, so `github` is listed nowhere a user
+    /// picks a provider from, and every per-provider row it used to own is gone.
+    /// (Was four tests pinning those rows: in KNOWN_PROVIDERS, GITHUB_TOKEN,
+    /// default `openai/gpt-4o`, a GitHub Models catalog of known ids.)
     #[test]
-    fn test_github_in_known_providers() {
-        assert!(
-            KNOWN_PROVIDERS.contains(&"github"),
-            "github should be in KNOWN_PROVIDERS"
-        );
+    fn retired_github_provider_has_no_listing_or_per_provider_rows() {
+        assert!(!KNOWN_PROVIDERS.contains(&"github"));
+        assert!(retired_provider_refusal("github").is_some());
+        // No ambient GITHUB_TOKEN is sent to the endpoint a `--base-url` run
+        // names: that endpoint is not GitHub Models, which no longer exists.
+        assert_eq!(provider_api_key_env("github"), None);
+        assert!(provider_api_key_vars("github").is_empty());
+        assert!(known_models_for_provider("github").is_empty());
+        // No guessed default: a `--base-url` run names its model, like custom.
+        assert!(provider_requires_named_model("github"));
+        // Near-miss: a listed provider keeps every row.
+        assert_eq!(provider_api_key_env("openai"), Some("OPENAI_API_KEY"));
+        assert!(!provider_requires_named_model("openai"));
     }
 
+    /// #1166: a retired provider is never also listed, and every retired row
+    /// carries a refusal that names the retirement.
     #[test]
-    fn test_github_provider_api_key_env() {
-        assert_eq!(provider_api_key_env("github"), Some("GITHUB_TOKEN"));
-    }
-
-    #[test]
-    fn test_github_default_model() {
-        assert_eq!(default_model_for_provider("github"), "openai/gpt-4o");
-    }
-
-    #[test]
-    fn test_github_known_models() {
-        let models = known_models_for_provider("github");
-        assert!(!models.is_empty(), "github should have known models");
-        assert!(models.contains(&"openai/gpt-4o"));
-        assert!(models.contains(&"anthropic/claude-sonnet-4-6"));
+    fn retired_providers_are_disjoint_from_known_providers() {
+        assert!(!RETIRED_PROVIDERS.is_empty());
+        for (name, msg) in RETIRED_PROVIDERS {
+            assert!(!KNOWN_PROVIDERS.contains(name), "{name} is listed");
+            assert!(msg.contains("retired"), "{name}: {msg}");
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "google_limits_tests.rs"]
+mod google_limits_tests;
 
 #[cfg(test)]
 #[path = "providers_key_tests.rs"]
@@ -974,3 +1231,117 @@ mod providers_key_tests;
 #[cfg(test)]
 #[path = "openrouter_preset_tests.rs"]
 mod openrouter_preset_tests;
+
+/// #1175: `custom` / unknown providers refuse when no model is named.
+#[cfg(test)]
+mod named_model_tests {
+    use super::*;
+
+    #[test]
+    fn requires_named_model_only_for_user_run_servers_with_no_honest_default() {
+        let rows: &[(&str, bool)] = &[
+            ("custom", true),
+            ("nosuch", true),
+            ("my-vllm", true),
+            // ollama's default (llama3.2) is a model ollama serves.
+            ("ollama", false),
+            ("openai", false),
+            ("anthropic", false),
+            ("openrouter", false),
+            ("bedrock", false),
+        ];
+        for (p, want) in rows {
+            assert_eq!(provider_requires_named_model(p), *want, "{p}");
+        }
+        // Every known provider except custom has a default that names a
+        // model the provider serves.
+        for p in KNOWN_PROVIDERS.iter().filter(|p| **p != "custom") {
+            assert!(!provider_requires_named_model(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn refusal_full_text_names_provider_and_the_users_base_url() {
+        let msg = named_model_required_refusal("custom", None, Some("http://127.0.0.1:9/v1/"))
+            .expect("custom with no model refuses");
+        assert_eq!(
+            msg,
+            "provider 'custom' needs a model name: yoyo cannot know which models your \
+server at http://127.0.0.1:9/v1 serves, so it does not guess one\n\
+name the model with: --model <id>   (or model = \"<id>\" in .yoyo.toml)\n\
+to list the ids your server serves: curl http://127.0.0.1:9/v1/models"
+        );
+        let unknown = named_model_required_refusal("nosuch", None, Some("http://h:1"))
+            .expect("unknown provider with no model refuses");
+        assert!(
+            unknown.starts_with("provider 'nosuch' needs a model name"),
+            "{unknown}"
+        );
+        assert!(unknown.ends_with("curl http://h:1/models"), "{unknown}");
+    }
+
+    #[test]
+    fn a_named_model_or_a_provider_with_a_real_default_never_refuses() {
+        assert_eq!(
+            named_model_required_refusal("custom", Some("qwen3"), None),
+            None
+        );
+        assert_eq!(
+            named_model_required_refusal("nosuch", Some("m"), Some("http://h")),
+            None
+        );
+        assert_eq!(named_model_required_refusal("ollama", None, None), None);
+        assert_eq!(named_model_required_refusal("anthropic", None, None), None);
+    }
+
+    #[test]
+    fn named_model_refusal_default_url_is_create_model_configs() {
+        // With no base URL the hint names where the run would have gone: the
+        // same fallback `create_model_config` uses for custom and unknown.
+        for p in ["custom", "nosuch"] {
+            let cfg = crate::agent_builder::create_model_config(p, "m", None);
+            assert_eq!(cfg.base_url, LOCAL_SERVER_DEFAULT_URL, "{p}");
+        }
+        let msg = named_model_required_refusal("custom", None, Some("  ")).unwrap();
+        assert!(
+            msg.contains("curl http://localhost:8080/v1/models"),
+            "{msg}"
+        );
+    }
+
+    /// The remedy round-trips: the motivating #1175 argv plus the printed
+    /// `--model <id>` puts the id in the model slot (and nowhere else), and
+    /// the refusal then lets the run through.
+    #[test]
+    fn printed_model_remedy_round_trips_through_the_parser() {
+        let mut argv: Vec<String> = [
+            "yoyo", // argv[0]: flag lookups start at 1
+            "--provider",
+            "custom",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "-p",
+            "hi",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(crate::dispatch_sub::flag_value(&argv, &["--model"]), None);
+        argv.extend(["--model".to_string(), "my-model".to_string()]);
+        let model = crate::dispatch_sub::flag_value(&argv, &["--model"]);
+        assert_eq!(model.as_deref(), Some("my-model"));
+        // The other words keep their slots.
+        assert_eq!(
+            crate::dispatch_sub::flag_value(&argv, &["--provider"]).as_deref(),
+            Some("custom")
+        );
+        assert_eq!(
+            crate::dispatch_sub::flag_value(&argv, &["-p"]).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            named_model_required_refusal("custom", model.as_deref(), Some("http://127.0.0.1:9")),
+            None
+        );
+    }
+}

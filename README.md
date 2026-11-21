@@ -171,7 +171,7 @@ Sub-agents also auto-receive `sub_agent` and `shared_state` tools for delegating
 ### 🔌 Multi-Provider Support
 Works with **15 providers** out of the box — switch mid-session with `/provider`:
 
-Anthropic · OpenAI · Google · Ollama · OpenRouter · xAI · Groq · DeepSeek · Mistral · Cerebras · AWS Bedrock · GitHub Models · Zhipu (ZAI) · MiniMax · Custom (any OpenAI-compatible endpoint)
+Anthropic · OpenAI · Google · Ollama · OpenRouter · xAI · Groq · DeepSeek · Mistral · Cerebras · AWS Bedrock · Zhipu (ZAI) · MiniMax · Custom (any OpenAI-compatible endpoint)
 
 ### 📂 Git Integration
 - `/diff` — full status + diff with insertion/deletion summary
@@ -348,7 +348,7 @@ Create a `YOYO.md` (or `CLAUDE.md`) in your project root with build commands, ar
 | `/evolution [N]` | Show evolution history, session stats, and CI run status |
 | `/exit`, `/quit` | Exit yoyo |
 | `/explain <file>` | Ask the agent to explain code from a file |
-| `/export` | Export the conversation as markdown |
+| `/export` | Export the conversation as markdown (won't overwrite an existing file without `--force`) |
 | `/extended <task>` | Run the agent autonomously on a long task |
 | `/extract` | Extract a function or block to a new file |
 | `/find <pattern>` | Fuzzy-search project files by name |
@@ -393,7 +393,7 @@ Create a `YOYO.md` (or `CLAUDE.md`) in your project root with build commands, ar
 | `/rewind` | Restore the conversation auto-stashed by `/clear` |
 | `/risk [subcmd]` | Per-file risk scoring from git history (`/risk accuracy`) |
 | `/run <cmd>` | Run a shell command directly (no AI, no tokens) |
-| `/save [path]` | Save session to file |
+| `/save [path] [--force]` | Save session to file (`--force` replaces a file this session did not write) |
 | `/search <query>` | Search conversation history |
 | `/security` | Run a dependency vulnerability scan |
 | `/side <question>` | Ask a quick question without affecting the conversation |

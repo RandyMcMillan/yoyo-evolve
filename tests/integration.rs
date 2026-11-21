@@ -426,6 +426,29 @@ fn help_output_lists_all_documented_cli_flags() {
     }
 }
 
+/// #1190: with no `--max-tokens`, yoyo never calls `with_max_tokens`, so the
+/// request carries the model preset's value (anthropic.rs / openai_compat.rs in
+/// yoagent 0.27.8) or no field at all (google, vertex, bedrock, responses), and
+/// the provider applies its own. "default: 8192" was false for most users.
+#[test]
+fn help_max_tokens_line_names_per_model_default_not_8192() {
+    let output = yoyo_cmd()
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run yoyo");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("--max-tokens"))
+        .expect("--help should have a --max-tokens line");
+    assert!(!line.contains("8192"), "stale default in: {line}");
+    assert!(
+        line.contains("(default: per model, from its preset or the provider)"),
+        "unexpected --max-tokens default wording: {line}"
+    );
+}
+
 #[test]
 fn help_output_lists_all_documented_repl_commands() {
     let output = yoyo_cmd()
@@ -3534,14 +3557,15 @@ fn changelog_evolution_tree_inside_a_git_repository_still_exit_zero() {
 #[test]
 fn risk_unknown_subcommand_exits_two_and_known_verb_exits_zero() {
     // #982 residue: `yoyo risk zz` printed its refusal and exited 0, so a
-    // script could not tell a typo from a run. The printed bytes are unchanged.
+    // script could not tell a typo from a run. #1127: the shell line names
+    // `yoyo risk`, the form a shell reader can type, not `/risk`.
     let dir = tempfile::tempdir().expect("tempdir");
     let out = yoyo_in_dir(dir.path(), &["risk", "zz"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(2), "stdout={stdout:?}");
     assert_eq!(
         stdout,
-        "Unknown /risk subcommand: zz\nAvailable: snapshot | validate | history | predict | \
+        "Unknown yoyo risk subcommand: zz\nAvailable: snapshot | validate | history | predict | \
          accuracy | effectiveness | epistemic | harvest | --all\n"
     );
     // Near miss: a known read-only verb in the same empty dir is success.
@@ -3970,6 +3994,39 @@ fn bare_ast_usage_names_yoyo_ast_not_the_repl_slash_form() {
 }
 
 #[test]
+fn unknown_lint_subcommand_on_the_shell_names_yoyo_lint_not_slash_lint() {
+    // #1127: `yoyo lint zz1` printed `Unknown /lint subcommand: zz1`. The
+    // unknown-token branch returns before project detection, so an empty
+    // temp dir is enough.
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["lint", "zz1"]);
+    assert_eq!(code, Some(2), "stdout={stdout} stderr={stderr}");
+    let first = stdout.lines().next().unwrap_or("");
+    assert_eq!(
+        first, "  Unknown yoyo lint subcommand: zz1",
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("/lint"),
+        "slash form on the shell: {stdout}"
+    );
+}
+
+#[test]
+fn skill_install_of_a_file_on_the_shell_names_yoyo_skill_not_slash_skill() {
+    // #1127: the not-a-directory hint said `/skill install expects ...`. A
+    // regular file fails before anything reads HOME or the network.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("notadir"), "x").unwrap();
+    let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["skill", "install", "notadir"]);
+    assert_eq!(code, Some(1), "stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        stderr,
+        "  error: not a directory: notadir\n  yoyo skill install expects a skill directory containing SKILL.md\n\n"
+    );
+}
+
+#[test]
 fn blame_with_an_inverted_range_is_a_usage_error_and_exits_two() {
     // Same parse-error branch as bare `blame`: a range the parser refuses is
     // a usage error, not a success.
@@ -3991,14 +4048,15 @@ fn blame_of_a_committed_file_keeps_exit_zero_under_no_color() {
 #[test]
 fn config_unknown_subcommand_refusal_exits_two() {
     // #982: `yoyo config zzz` printed its refusal on stderr and exited 0.
-    // The refusal text is unchanged; only the exit status moves.
+    // Day 253: its text also claimed `zzz` "requires an interactive session",
+    // which is false (no surface has it), so it now says unknown.
     let dir = tempfile::tempdir().expect("tempdir");
     let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["config", "zzz"]);
     assert_eq!(code, Some(2), "stdout={stdout} stderr={stderr}");
     assert_eq!(stdout, "");
     assert_eq!(
         stderr,
-        "  `config zzz` requires an interactive session.\n  Try: yoyo config show (works from the shell)\n"
+        "  unknown config subcommand: `zzz`\n  Try: yoyo config show, yoyo config get <key> (work from the shell); inside yoyo: /config edit, /config set\n"
     );
 }
 
@@ -4190,6 +4248,96 @@ fn unknown_skill_goal_todo_and_bare_ast_exit_two_through_the_binary() {
 }
 
 #[test]
+fn skill_show_install_init_without_an_argument_exit_two_with_usage() {
+    // #1153: `yoyo skill show|install|init` with nothing after them printed
+    // their usage line and exited 0, so `yoyo skill init && next` carried on.
+    // A missing argument is a usage error, 2, like `yoyo skill nosuch`; the
+    // usage line must still be printed (a silent refusal would be a new bug).
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (sub, usage) in [
+        ("show", "usage: yoyo skill show <name>"),
+        ("install", "usage: yoyo skill install <path|gh:user/repo>"),
+        ("init", "usage: yoyo skill init <name>"),
+    ] {
+        let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["skill", sub]);
+        assert_eq!(code, Some(2), "{sub}: stdout={stdout} stderr={stderr}");
+        assert_eq!(stderr.lines().next().map(str::trim), Some(usage), "{sub}");
+        assert!(!stderr.contains("/skill "), "{sub}: {stderr}"); // REPL form
+    }
+    // Near-miss: `list` takes no argument and still succeeds.
+    let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["skill", "list"]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    // Bare `init` scaffolded nothing.
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn second_level_shell_lines_name_yoyo_forms_and_config_get_without_key_exits_two() {
+    // #1154: `yoyo config get` with no key printed usage and exited 0, so
+    // `yoyo config get && next` carried on. It is a usage error: 2, usage on
+    // stderr, like `yoyo skill show`. #1155: these lines named `/lint` and
+    // `/risk`, which a shell cannot run. The four no-data rows are not
+    // failures, so their exit codes are pinned unchanged.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["config", "get"]);
+    assert_eq!(code, Some(2), "stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        stderr.lines().next().map(str::trim),
+        Some("usage: yoyo config get <key>")
+    );
+    assert!(stderr.contains("settable keys: model"), "{stderr}");
+    assert!(!stderr.contains("/config"), "{stderr}");
+    for (args, code_want, line) in [
+        (&["lint", "unsafe"][..], 1, "yoyo lint unsafe is only available for Rust projects (no Cargo.toml found)"),
+        (&["risk", "validate"][..], 0, "No snapshots found. Run yoyo risk snapshot first."),
+        (&["risk", "history"][..], 0, "No snapshots found. Run yoyo risk snapshot periodically to build history."),
+        (&["risk", "harvest"][..], 0, "No snapshots found — run yoyo risk snapshot first (nothing to grade CI failures against)."),
+        (&["risk", "accuracy"][..], 0, "Run yoyo risk snapshot first, then trigger a watch failure"),
+    ] {
+        let (code, stdout, stderr) = yoyo_plain_in(dir.path(), args);
+        assert_eq!(code, Some(code_want), "{args:?}: stdout={stdout} stderr={stderr}");
+        assert!(stdout.lines().any(|l| l.trim() == line), "{args:?}: {stdout}");
+        assert!(!stdout.contains(&format!("/{}", args[0])), "{args:?}: {stdout}");
+    }
+    // Near miss: a key still reads and exits 0.
+    let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["config", "get", "model"]);
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    // One real snapshot (written by `yoyo risk snapshot`, not typed): history's
+    // "need at least 2" branch names the shell form too.
+    for git in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ][..],
+    ] {
+        let ok = Command::new("git")
+            .args(git)
+            .current_dir(dir.path())
+            .status()
+            .expect("git");
+        assert!(ok.success(), "git {git:?}");
+    }
+    let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["risk", "snapshot"]);
+    assert_eq!(code, Some(0), "snapshot: stdout={stdout} stderr={stderr}");
+    let (code, stdout, _) = yoyo_plain_in(dir.path(), &["risk", "history"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(stdout.contains("Need at least 2 snapshots"), "{stdout}");
+    assert!(
+        stdout.contains("Run yoyo risk snapshot periodically"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("/risk"), "{stdout}");
+}
+
+#[test]
 fn config_set_and_edit_refusals_exit_two() {
     // `set` and `edit` share the unknown-subcommand arm: from the shell they
     // are refused (they need agent state), so `yoyo config set ... && next`
@@ -4206,10 +4354,29 @@ fn config_set_and_edit_refusals_exit_two() {
         assert_eq!(
             stderr,
             format!(
-                "  `config {verb}` requires an interactive session.\n  Try: yoyo config show (works from the shell)\n"
+                "  `config {verb}` requires an interactive session: start yoyo and use /config {verb}\n  Try: yoyo config show, yoyo config get <key> (work from the shell)\n"
             ),
             "{args:?}"
         );
+    }
+}
+
+#[test]
+fn config_unknown_word_refuses_as_unknown_not_interactive() {
+    // A word that is no config subcommand anywhere must not claim the REPL
+    // would run it; a typo of a real one gets a did-you-mean. Exit 2 both.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hint = "  Try: yoyo config show, yoyo config get <key> (work from the shell); inside yoyo: /config edit, /config set\n";
+    for (word, headline) in [
+        ("bogus", "unknown config subcommand: `bogus`"),
+        (
+            "shwo",
+            "unknown config subcommand: `shwo` (did you mean `show`?)",
+        ),
+    ] {
+        let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["config", word]);
+        assert_eq!(code, Some(2), "{word}: stdout={stdout} stderr={stderr}");
+        assert_eq!(stderr, format!("  {headline}\n{hint}"), "{word}");
     }
 }
 
@@ -4524,8 +4691,9 @@ fn docs_lint_skill_take_one_spaced_argv_element_whole() {
     let (code, stdout, stderr) = yoyo_plain_in(dir.path(), &["lint", "a b"]);
     assert_eq!(code, Some(2), "stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(
-        line(&stdout, "Unknown /lint subcommand"),
-        "  Unknown /lint subcommand: a b"
+        line(&stdout, "Unknown yoyo lint subcommand"),
+        // #1127: the shell door names `yoyo lint`, not the REPL's `/lint`.
+        "  Unknown yoyo lint subcommand: a b"
     );
     assert!(!stdout.contains('"'), "{stdout:?}");
 
@@ -4543,8 +4711,8 @@ fn docs_lint_skill_take_one_spaced_argv_element_whole() {
     let (code, stdout, _) = yoyo_plain_in(dir.path(), &["lint", "zzzq"]);
     assert_eq!(code, Some(2), "{stdout:?}");
     assert_eq!(
-        line(&stdout, "Unknown /lint subcommand"),
-        "  Unknown /lint subcommand: zzzq"
+        line(&stdout, "Unknown yoyo lint subcommand"),
+        "  Unknown yoyo lint subcommand: zzzq"
     );
 
     // Near misses. `yoyo lint` with no project still exits 1 (nothing ran);
@@ -4569,7 +4737,9 @@ fn docs_lint_skill_take_one_spaced_argv_element_whole() {
     // An empty crate argument is usage too (2), not an invalid name (1).
     let (code, stdout, _) = yoyo_plain_in(dir.path(), &["docs", ""]);
     assert_eq!(code, Some(2), "{stdout:?}");
-    assert!(stdout.contains("usage: /docs"), "{stdout:?}");
+    // #1127: and the usage names the shell form, not the REPL's `/docs`.
+    assert!(stdout.contains("usage: yoyo docs"), "{stdout:?}");
+    assert!(!stdout.contains("/docs"), "{stdout:?}");
 }
 
 #[test]

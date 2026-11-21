@@ -655,26 +655,36 @@ fn test_main_never_calls_the_tracker_less_prompt_wrappers() {
 #[test]
 fn piped_should_continue_requires_every_condition() {
     // All conditions met -> continue.
-    assert!(piped_should_continue(true, 0, 5, false, false, true));
-    assert!(piped_should_continue(true, 4, 5, false, false, true));
+    assert!(piped_should_continue(true, 0, 5, false, false, true, false));
+    assert!(piped_should_continue(true, 4, 5, false, false, true, false));
 
     // Not opted in -> never continues, whatever else is true.
-    assert!(!piped_should_continue(false, 0, 5, false, false, true));
+    assert!(!piped_should_continue(
+        false, 0, 5, false, false, true, false
+    ));
 
     // Budget spent: count == max stops, and so does count > max.
-    assert!(!piped_should_continue(true, 5, 5, false, false, true));
-    assert!(!piped_should_continue(true, 6, 5, false, false, true));
+    assert!(!piped_should_continue(
+        true, 5, 5, false, false, true, false
+    ));
+    assert!(!piped_should_continue(
+        true, 6, 5, false, false, true, false
+    ));
     // max == 0 (auto_continue disabled in config) stops immediately.
-    assert!(!piped_should_continue(true, 0, 0, false, false, true));
+    assert!(!piped_should_continue(
+        true, 0, 0, false, false, true, false
+    ));
 
     // An error on the previous turn stops.
-    assert!(!piped_should_continue(true, 0, 5, true, false, true));
+    assert!(!piped_should_continue(true, 0, 5, true, false, true, false));
 
     // A spent session wall-clock budget stops.
-    assert!(!piped_should_continue(true, 0, 5, false, true, true));
+    assert!(!piped_should_continue(true, 0, 5, false, true, true, false));
 
     // The shared predicate says there's nothing pending -> stop.
-    assert!(!piped_should_continue(true, 0, 5, false, false, false));
+    assert!(!piped_should_continue(
+        true, 0, 5, false, false, false, false
+    ));
 }
 
 /// Source-level connectivity check: the piped path must still consult the
@@ -1654,6 +1664,77 @@ fn save_session_to_round_trips_and_refuses_missing_parent() {
     );
     assert!(msg.contains("s.json"), "{msg}");
     assert!(!msg.as_bytes().contains(&0x1b), "{msg:?}");
+}
+
+// #1214: `--save-session` replaces only a file yoyo's session loader accepts.
+fn session_target(dir: &std::path::Path, name: &str, body: Option<&str>) -> std::path::PathBuf {
+    let p = dir.join(name);
+    if let Some(b) = body {
+        std::fs::write(&p, b).unwrap();
+    }
+    p
+}
+
+#[test]
+fn save_session_refuses_an_existing_non_session_file_and_leaves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = session_target(dir.path(), "sess.json", Some("keep"));
+    let msg = save_session_target_refusal(&p).expect("a non-session file must be refused");
+    assert!(msg.starts_with("error: --save-session: "), "{msg}");
+    assert!(msg.contains("sess.json"), "{msg}");
+    assert!(msg.contains("is not a yoyo session file"), "{msg}");
+    assert!(msg.contains("not replaced"), "{msg}");
+    // The write-time seam refuses too, and the file is untouched.
+    let agent = test_agent_config("anthropic", "claude-sonnet-4-5").build_agent();
+    assert!(save_session_to(&agent, &p).is_err());
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "keep");
+}
+
+#[test]
+fn save_session_refuses_an_existing_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = session_target(dir.path(), "empty.json", Some(""));
+    assert!(save_session_target_refusal(&p).is_some());
+}
+
+#[test]
+fn save_session_refuses_an_existing_invalid_json_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = session_target(dir.path(), "bad.json", Some("{not json"));
+    assert!(save_session_target_refusal(&p).is_some());
+    // Valid JSON that is not a message list is still not a session.
+    let q = session_target(dir.path(), "obj.json", Some(r#"{"a":1}"#));
+    assert!(save_session_target_refusal(&q).is_some());
+}
+
+#[test]
+fn save_session_replaces_an_existing_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = serde_json::to_string(&vec![yoagent::AgentMessage::Llm(yoagent::Message::user(
+        "old",
+    ))])
+    .unwrap();
+    let p = session_target(dir.path(), "run.json", Some(&old));
+    assert_eq!(save_session_target_refusal(&p), None);
+    // An empty history (`[]`) is what a saved session with no turns looks like.
+    let e = session_target(dir.path(), "none.json", Some("[]"));
+    assert_eq!(save_session_target_refusal(&e), None);
+    let agent = test_agent_config("anthropic", "claude-sonnet-4-5").build_agent();
+    save_session_to(&agent, &p).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        agent.save_messages().unwrap()
+    );
+}
+
+#[test]
+fn save_session_writes_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = session_target(dir.path(), "new.json", None);
+    assert_eq!(save_session_target_refusal(&p), None);
+    let agent = test_agent_config("anthropic", "claude-sonnet-4-5").build_agent();
+    save_session_to(&agent, &p).unwrap();
+    assert!(p.exists());
 }
 
 /// #1092 at the emission point: a `response` carrying a bidi override leaves

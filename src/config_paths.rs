@@ -55,25 +55,48 @@ pub(crate) fn existing_config_paths() -> Vec<std::path::PathBuf> {
 /// second copy would drift from `config::load_config_file`, which is the whole
 /// property these helpers exist to mirror.
 pub(crate) fn existing_config_paths_in(project_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut found = Vec::new();
+    existing_config_paths_with(
+        project_dir,
+        crate::cli::home_config_path(),
+        crate::cli::user_config_path(),
+    )
+}
+
+/// [`existing_config_paths_in`] with the two user-level rungs passed in, so tests
+/// can point `~` at a tempdir without touching `$HOME` (#1185).
+///
+/// Rungs are deduplicated by **file identity**, keeping the higher one: run from
+/// `$HOME` and the project rung `./.yoyo.toml` *is* `~/.yoyo.toml`, and a symlink
+/// can make any two rungs one file. Listed twice, every consumer reads the file
+/// yoyo loads as a lower rung it skipped: `/config show` said "Also present, not
+/// read ... nothing in the file(s) above takes effect" about the live config, and
+/// `/config set --global` from `$HOME` warned that its write was shadowed by
+/// itself. Identity is `canonicalize`, falling back to the absolute path when
+/// that fails (the file exists, so it rarely does).
+pub(crate) fn existing_config_paths_with(
+    project_dir: &std::path::Path,
+    home: Option<std::path::PathBuf>,
+    xdg: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
     // Project-level: <project_dir>/.yoyo.toml
     let project = if project_dir == std::path::Path::new(".") {
         std::path::PathBuf::from(".yoyo.toml")
     } else {
         project_dir.join(".yoyo.toml")
     };
-    if project.exists() {
-        found.push(project);
-    }
-    // Home shorthand: ~/.yoyo.toml
-    if let Some(path) = crate::cli::home_config_path() {
-        if path.exists() {
-            found.push(path);
-        }
-    }
-    // XDG user-level: ~/.config/yoyo/config.toml
-    if let Some(path) = crate::cli::user_config_path() {
-        if path.exists() {
+    // Then ~/.yoyo.toml, then ~/.config/yoyo/config.toml.
+    let rungs = std::iter::once(Some(project)).chain([home, xdg]).flatten();
+    let identity = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .or_else(|_| std::path::absolute(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let mut found = Vec::new();
+    let mut seen = Vec::new();
+    for path in rungs.filter(|p| p.exists()) {
+        let id = identity(&path);
+        if !seen.contains(&id) {
+            seen.push(id);
             found.push(path);
         }
     }
@@ -142,6 +165,72 @@ pub(crate) fn shadowing_config_file(
         None
     } else {
         existing.first().cloned()
+    }
+}
+
+/// The startup warning for two **user-level** config files (Day 253): `home`
+/// (`~/.yoyo.toml`) and `xdg` (`~/.config/yoyo/config.toml`, or under
+/// `$XDG_CONFIG_HOME`) both existing. yoyo reads one config file, first found
+/// wins, never merged, and `~/.yoyo.toml` always comes before the XDG file, so
+/// every setting in the XDG file is lost wherever yoyo runs. A stray
+/// `~/.yoyo.toml` (an old install, a dotfile sync) silently disables a config
+/// the user maintains. The project file is an input only to pin the near-miss:
+/// a project `.yoyo.toml` shadowing ONE home file is the intended layering and
+/// happens to every user with a global config, so it never warns (a warning
+/// there would fire on every run). With a project file AND both home files the
+/// home pair still warns: the XDG file is still never read anywhere. Same
+/// predicate as Claude Code 2.1.319's "a home holds two config files".
+pub(crate) fn home_config_shadow_warning(
+    _project: &std::path::Path,
+    home: Option<&std::path::Path>,
+    xdg: Option<&std::path::Path>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    let (home, xdg) = (home?, xdg?);
+    if home == xdg || !exists(home) || !exists(xdg) {
+        return None;
+    }
+    Some(format!(
+        "two user-level yoyo config files: {} takes precedence, so {} is ignored. \
+Merge them or delete one.",
+        home.display(),
+        xdg.display()
+    ))
+}
+
+/// Set once the two-home-files warning has printed, so it appears once per
+/// process however many times config is loaded (the REPL and watch reload it).
+static HOME_SHADOW_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`home_config_shadow_warning`] over the real disk, printed once to stderr.
+/// Called from `config::accept_loaded_config`, the one tail every config load
+/// goes through. Not gated on quiet mode: it reports lost settings, like the
+/// `config file skipped` warning beside it. Two paths that resolve to one file
+/// (a dotfile manager symlinking both) are one config, not two.
+pub(crate) fn warn_home_config_shadow_once() {
+    let (home, xdg) = (
+        crate::cli::home_config_path(),
+        crate::cli::user_config_path(),
+    );
+    let same_file = match (&home, &xdg) {
+        (Some(h), Some(x)) => matches!(
+            (std::fs::canonicalize(h), std::fs::canonicalize(x)),
+            (Ok(a), Ok(b)) if a == b
+        ),
+        _ => false,
+    };
+    if same_file {
+        return;
+    }
+    let exists = |p: &std::path::Path| p.exists();
+    let project = std::path::Path::new(".yoyo.toml");
+    if let Some(msg) = home_config_shadow_warning(project, home.as_deref(), xdg.as_deref(), exists)
+    {
+        if !HOME_SHADOW_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            use crate::format::{RESET, YELLOW};
+            eprintln!("{YELLOW}warning:{RESET} {msg}");
+        }
     }
 }
 
@@ -444,7 +533,7 @@ pub(crate) fn project_trust_grants(
             // section header cannot double-count.
             line.trim()
                 .split_once('=')
-                .is_some_and(|(k, _)| k.trim() == "mcp")
+                .is_some_and(|(k, _)| crate::config_unknown_keys::config_key_name(k) == "mcp")
         })
     {
         grants.push("MCP servers (external processes yoyo would start)");
@@ -463,8 +552,18 @@ pub(crate) fn project_trust_grants(
     // produces, not raw text, and rebuilding that map here would be a second loader.
     // A key-prefix scan is enough for a predicate whose only job is "is there
     // something worth asking about" — and both error directions are safe (above).
-    if crate::hooks::config_text_names_a_hook(config_text) {
+    // #1184: the map the hook reader takes now holds every TOML spelling
+    // (`hooks = { pre = ... }` too), so a hook it holds is asked about as well.
+    let parsed = crate::config::parse_config_file(config_text);
+    if crate::hooks::config_text_names_a_hook(config_text)
+        || parsed.keys().any(|k| k.starts_with("hooks."))
+    {
         grants.push("shell hooks (commands run on tool calls)");
+    }
+
+    // #1179: the host the user's API key is sent to (`project_base_url`'s gate).
+    if parsed.get("base_url").is_some_and(|u| !u.trim().is_empty()) {
+        grants.push("base_url (the host your API key is sent to)");
     }
 
     if goal_verify_exists {
@@ -500,9 +599,9 @@ pub(crate) fn project_trust_grants(
     // a bare key so a longer key that merely ends in `notify_command` cannot
     // count.
     if config_text.lines().any(|line| {
-        line.trim()
-            .split_once('=')
-            .is_some_and(|(k, _)| k.trim() == "notify_command")
+        line.trim().split_once('=').is_some_and(|(k, _)| {
+            crate::config_unknown_keys::config_key_name(k) == "notify_command"
+        })
     }) {
         grants.push("notify_command (a shell command run when a prompt finishes)");
     }
@@ -726,6 +825,177 @@ in-project symlink is unaffected.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === #1185: a rung that is the same file as a higher rung is one config ===
+    //
+    // Running from $HOME makes the project rung `./.yoyo.toml` and the home rung
+    // `~/.yoyo.toml` one file. Every consumer of the chain is asserted on its own
+    // output, over a tempdir standing in for both cwd and HOME (no env, no cwd).
+    #[test]
+    fn cwd_is_home_lists_the_one_config_once_and_no_consumer_calls_it_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let home_file = home_dir.join(".yoyo.toml");
+        std::fs::write(&home_file, "model = \"m1\"\n").unwrap();
+        let xdg = home_dir.join(".config/yoyo/config.toml"); // absent
+
+        // Two spellings of "cwd is HOME": the same string, and a symlinked dir
+        // whose path differs from HOME's but names the same file.
+        let link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&home_dir, &link).unwrap();
+        let mut project_dirs = vec![home_dir.clone()];
+        if link.exists() {
+            project_dirs.push(link.clone());
+        }
+        for project_dir in project_dirs {
+            let chain = existing_config_paths_with(
+                &project_dir,
+                Some(home_file.clone()),
+                Some(xdg.clone()),
+            );
+            let head = project_dir.join(".yoyo.toml");
+            assert_eq!(
+                chain,
+                vec![head.clone()],
+                "one file, listed once (higher rung kept)"
+            );
+            // /config show and /config get: nothing skipped.
+            assert!(skipped_config_sources(&chain, Some(&head)).is_empty());
+            // /config set --global from $HOME writes the home spelling: not shadowed by itself.
+            assert_eq!(shadowing_config_file(&home_file, &chain), None);
+            assert_eq!(shadowing_config_file(&head, &chain), None);
+            // Writing the home spelling demotes nothing (the loaded file is that file).
+            assert_eq!(demoted_config_file(&home_file, &chain, &chain), None);
+            assert_eq!(demoted_config_file(&head, &[], &chain), None);
+            // The two-home-files warning: only one user-level file exists.
+            let warn =
+                home_config_shadow_warning(&head, Some(&home_file), Some(&xdg), |p| p.exists());
+            assert_eq!(warn, None);
+        }
+    }
+
+    #[test]
+    fn cwd_elsewhere_still_reports_the_home_config_as_not_read() {
+        // Near-miss: a real project file and a real (different) home file. The
+        // home file IS shadowed, and every consumer must still say so.
+        let tmp = tempfile::tempdir().unwrap();
+        let (proj, home_dir) = (tmp.path().join("proj"), tmp.path().join("home"));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(home_dir.join(".config/yoyo")).unwrap();
+        let project_file = proj.join(".yoyo.toml");
+        let home_file = home_dir.join(".yoyo.toml");
+        let xdg = home_dir.join(".config/yoyo/config.toml");
+        for f in [&project_file, &home_file, &xdg] {
+            std::fs::write(f, "model = \"m\"\n").unwrap();
+        }
+        let chain = existing_config_paths_with(&proj, Some(home_file.clone()), Some(xdg.clone()));
+        assert_eq!(
+            chain,
+            vec![project_file.clone(), home_file.clone(), xdg.clone()]
+        );
+        assert_eq!(
+            skipped_config_sources(&chain, Some(&project_file)),
+            vec![home_file.clone(), xdg.clone()]
+        );
+        assert_eq!(
+            shadowing_config_file(&home_file, &chain),
+            Some(project_file.clone())
+        );
+        assert_eq!(
+            demoted_config_file(&project_file, &chain[1..], &chain),
+            Some(home_file.clone())
+        );
+        assert!(
+            home_config_shadow_warning(&project_file, Some(&home_file), Some(&xdg), |p| p.exists())
+                .is_some()
+        );
+    }
+
+    // === home_config_shadow_warning: two user-level files (Day 253) ===
+    #[test]
+    fn home_config_shadow_warning_table() {
+        use std::path::Path;
+        let project = Path::new("/repo/.yoyo.toml");
+        let home = Path::new("/h/.yoyo.toml");
+        let xdg = Path::new("/h/.config/yoyo/config.toml");
+        let on =
+            |set: &'static [&'static str]| move |p: &Path| set.iter().any(|s| Path::new(s) == p);
+        let both = "two user-level yoyo config files: /h/.yoyo.toml takes precedence, \
+so /h/.config/yoyo/config.toml is ignored. Merge them or delete one.";
+        // Both home files: warns, naming the one that wins first.
+        assert_eq!(
+            home_config_shadow_warning(
+                project,
+                Some(home),
+                Some(xdg),
+                on(&["/h/.yoyo.toml", "/h/.config/yoyo/config.toml"])
+            ),
+            Some(both.to_string())
+        );
+        // Only one home file (either one): silent.
+        assert_eq!(
+            home_config_shadow_warning(project, Some(home), Some(xdg), on(&["/h/.yoyo.toml"])),
+            None
+        );
+        assert_eq!(
+            home_config_shadow_warning(
+                project,
+                Some(home),
+                Some(xdg),
+                on(&["/h/.config/yoyo/config.toml"])
+            ),
+            None
+        );
+        // Near-miss: project + one home file is the intended layering, silent.
+        assert_eq!(
+            home_config_shadow_warning(
+                project,
+                Some(home),
+                Some(xdg),
+                on(&["/repo/.yoyo.toml", "/h/.config/yoyo/config.toml"])
+            ),
+            None
+        );
+        assert_eq!(
+            home_config_shadow_warning(
+                project,
+                Some(home),
+                Some(xdg),
+                on(&["/repo/.yoyo.toml", "/h/.yoyo.toml"])
+            ),
+            None
+        );
+        // Project + both home files: the XDG file is still never read, so it warns.
+        assert_eq!(
+            home_config_shadow_warning(
+                project,
+                Some(home),
+                Some(xdg),
+                on(&[
+                    "/repo/.yoyo.toml",
+                    "/h/.yoyo.toml",
+                    "/h/.config/yoyo/config.toml"
+                ])
+            ),
+            Some(both.to_string())
+        );
+        // No usable HOME / XDG base: nothing to compare.
+        assert_eq!(
+            home_config_shadow_warning(project, None, Some(xdg), |_| true),
+            None
+        );
+        assert_eq!(
+            home_config_shadow_warning(project, Some(home), None, |_| true),
+            None
+        );
+        // One path for both (cannot happen with today's layout): one file, silent.
+        assert_eq!(
+            home_config_shadow_warning(project, Some(home), Some(home), |_| true),
+            None
+        );
+    }
 
     // === skipped_config_sources: the read-side half of the ladder (Day 179) ===
     //
@@ -1220,6 +1490,10 @@ and CI have nobody to answer, so they take the safe answer silently"
             project_trust_grants("[hooks.post]\nbash = \"echo hi\"\n", false, false, false),
             vec!["shell hooks (commands run on tool calls)"]
         );
+        assert_eq!(
+            project_trust_grants("base_url = \"http://h/v1\"\n", false, false, false),
+            vec!["base_url (the host your API key is sent to)"]
+        );
         // The fourth surface has no config key at all — it is a file on disk.
         assert_eq!(
             project_trust_grants("", true, false, false),
@@ -1259,6 +1533,8 @@ continue_on_silence = true\nwait_for_reset = true\nquiet = true\n",
 
         // An empty config asks nothing.
         assert!(project_trust_grants("", false, false, false).is_empty());
+        // #1179: a blank base_url names no host.
+        assert!(project_trust_grants("base_url = \"\"\n", false, false, false).is_empty());
     }
 
     #[test]

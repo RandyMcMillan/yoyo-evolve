@@ -1,5 +1,6 @@
 //! Skill-related command handlers: /skill list, show, path, install, search.
 
+use crate::commands_dev::DoctorSurface;
 use crate::format::*;
 
 /// Subcommand names for `/skill <Tab>` completion.
@@ -11,7 +12,7 @@ pub const SKILL_SUBCOMMANDS: &[&str] = &["list", "show", "path", "install", "sea
 /// to the loaded `SkillSet`. If no skills directory is configured, prints a
 /// helpful message about the `--skills` flag.
 pub fn handle_skill(input: &str, skills: &yoagent::skills::SkillSet) {
-    handle_skill_status(input, skills);
+    handle_skill_on(input, skills, DoctorSurface::Repl);
 }
 
 /// [`handle_skill`], returning the process exit code the shell `yoyo skill`
@@ -22,6 +23,17 @@ pub fn handle_skill(input: &str, skills: &yoagent::skills::SkillSet) {
 /// clone or fetch fails (2 for an invalid `init` name); an existing skill
 /// left alone and an empty search result stay 0, like `yoyo init`.
 pub fn handle_skill_status(input: &str, skills: &yoagent::skills::SkillSet) -> i32 {
+    handle_skill_on(input, skills, DoctorSurface::Shell)
+}
+
+/// Shared body of both doors; `surface` spells every usage and `try:` line
+/// (#1127), so a shell reader is told `yoyo skill list`, never `/skill list`.
+pub(crate) fn handle_skill_on(
+    input: &str,
+    skills: &yoagent::skills::SkillSet,
+    surface: DoctorSurface,
+) -> i32 {
+    let skill = crate::commands_dev::command_form(surface, "skill");
     let sub = input.strip_prefix("/skill").unwrap_or(input).trim();
 
     if sub.is_empty() || sub == "list" {
@@ -34,47 +46,61 @@ pub fn handle_skill_status(input: &str, skills: &yoagent::skills::SkillSet) -> i
         eprint!("{}", report.stderr);
         return report.code;
     } else if sub == "show" {
-        eprintln!("{YELLOW}  usage: /skill show <name>{RESET}");
-        eprintln!("{DIM}  try /skill list to see available skills{RESET}\n");
+        eprintln!("{YELLOW}  usage: {skill} show <name>{RESET}");
+        eprintln!("{DIM}  try {skill} list to see available skills{RESET}\n");
+        return 2; // #1153: a missing argument is a usage error, like `skill zzz`
     } else if let Some(source) = sub.strip_prefix("install ") {
         let source = source.trim();
         if source.is_empty() {
-            eprintln!("{YELLOW}  usage: /skill install <path|gh:user/repo>{RESET}");
+            eprintln!("{YELLOW}  usage: {skill} install <path|gh:user/repo>{RESET}");
             eprintln!(
                 "{DIM}  install a skill from a local directory or GitHub repository{RESET}\n"
             );
+            return 2;
         } else {
-            return skill_install(source);
+            return skill_install(source, &skill);
         }
     } else if sub == "install" {
-        eprintln!("{YELLOW}  usage: /skill install <path|gh:user/repo>{RESET}");
+        eprintln!("{YELLOW}  usage: {skill} install <path|gh:user/repo>{RESET}");
         eprintln!("{DIM}  install a skill from a local directory or GitHub repository{RESET}\n");
+        return 2;
     } else if let Some(query) = sub.strip_prefix("search ") {
         let query = query.trim();
         if query.is_empty() {
-            return handle_skill_search(None);
+            return handle_skill_search(None, &skill);
         } else {
-            return handle_skill_search(Some(query));
+            return handle_skill_search(Some(query), &skill);
         }
     } else if sub == "search" {
-        return handle_skill_search(None);
+        return handle_skill_search(None, &skill);
     } else if let Some(name) = sub.strip_prefix("init ") {
         let name = name.trim();
         if name.is_empty() {
-            eprintln!("{YELLOW}  usage: /skill init <name>{RESET}");
+            eprintln!("{YELLOW}  usage: {skill} init <name>{RESET}");
             eprintln!("{DIM}  scaffold a new skill in .yoyo/skills/<name>/SKILL.md{RESET}\n");
+            return 2;
         } else {
             return skill_init(name);
         }
     } else if sub == "init" {
-        eprintln!("{YELLOW}  usage: /skill init <name>{RESET}");
+        eprintln!("{YELLOW}  usage: {skill} init <name>{RESET}");
         eprintln!("{DIM}  scaffold a new skill in .yoyo/skills/<name>/SKILL.md{RESET}\n");
+        return 2;
     } else {
         eprintln!("{RED}  unknown subcommand: {sub}{RESET}");
-        eprintln!("{DIM}  try: /skill list, /skill show <name>, /skill path, /skill install <path>, /skill search <query>, /skill init <name>{RESET}\n");
+        eprintln!("{DIM}  {}{RESET}\n", skill_try_line(surface));
         return 2;
     }
     0
+}
+
+/// The `try:` line after an unknown `/skill` subcommand, one alternative per
+/// [`SKILL_SUBCOMMANDS`] entry, spelled for `surface` (#1127).
+pub(crate) fn skill_try_line(surface: DoctorSurface) -> String {
+    let skill = crate::commands_dev::command_form(surface, "skill");
+    format!(
+        "try: {skill} list, {skill} show <name>, {skill} path, {skill} install <path>, {skill} search <query>, {skill} init <name>"
+    )
 }
 
 /// Validate a skill name: must be kebab-case (a-z, 0-9, hyphens).
@@ -310,7 +336,8 @@ struct SkillSearchResult {
 /// Searches for repositories with the `yoyo-skill` topic. If no topic-based
 /// results are found, falls back to a text search for "yoyo-skill".
 /// Displays results in a formatted table with install hints.
-fn handle_skill_search(query: Option<&str>) -> i32 {
+/// `skill` is the door's form of the verb (`command_form`, #1127).
+fn handle_skill_search(query: Option<&str>, skill: &str) -> i32 {
     // Check if gh CLI is available
     let gh_check = std::process::Command::new("gh")
         .arg("--version")
@@ -385,7 +412,7 @@ fn handle_skill_search(query: Option<&str>) -> i32 {
         println!("    {GREEN}{name_display}{RESET}{padding}  {DIM}{desc}{RESET}{updated_str}");
     }
 
-    println!("\n{DIM}  install with: /skill install gh:<owner>/<repo>{RESET}\n");
+    println!("\n{DIM}  {}{RESET}\n", skill_search_install_hint(skill));
     0
 }
 
@@ -616,13 +643,18 @@ pub(crate) fn skill_install_dir_from(
     Some(config_dir.join("yoyo").join("skills"))
 }
 
+/// The last line of a search listing, spelled for the door (#1127).
+pub(crate) fn skill_search_install_hint(skill: &str) -> String {
+    format!("install with: {skill} install gh:<owner>/<repo>")
+}
+
 /// Install a skill from a local directory path.
 ///
 /// Validates the source, extracts the skill name from SKILL.md frontmatter,
 /// and copies the entire directory to `~/.config/yoyo/skills/<name>/`.
 ///
 /// If the source starts with `gh:`, delegates to [`skill_install_from_github`].
-fn skill_install(source: &str) -> i32 {
+fn skill_install(source: &str, skill: &str) -> i32 {
     if source.starts_with("gh:") {
         return skill_install_from_github(source);
     }
@@ -636,7 +668,7 @@ fn skill_install(source: &str) -> i32 {
     }
     if !source_path.is_dir() {
         eprintln!("{RED}  error: not a directory: {source}{RESET}");
-        eprintln!("{DIM}  /skill install expects a skill directory containing SKILL.md{RESET}\n");
+        eprintln!("{DIM}  {skill} install expects a skill directory containing SKILL.md{RESET}\n");
         return 1;
     }
 
@@ -1934,7 +1966,7 @@ mod tests {
         assert_eq!(handle_skill_status("/skill show demo", &skills), 0);
         assert_eq!(handle_skill_status("/skill show nosuch", &skills), 1);
         assert_eq!(handle_skill_status("/skill list", &skills), 0);
-        assert_eq!(handle_skill_status("/skill show", &skills), 0);
+        assert_eq!(handle_skill_status("/skill show", &skills), 2); // #1153: usage error
     }
 
     #[test]

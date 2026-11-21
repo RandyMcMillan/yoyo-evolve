@@ -791,18 +791,6 @@ fn model_context_window_table(model: &str) -> Option<u64> {
     if model.starts_with("o3") || model.starts_with("o4") {
         return Some(200_000);
     }
-    // Google Gemini 3.x — 1M (estimated, Google's trajectory)
-    if model.contains("gemini-3") {
-        return Some(1_048_576);
-    }
-    // Google Gemini 2.5 — 1M
-    if model.contains("gemini-2.5") {
-        return Some(1_048_576);
-    }
-    // Google Gemini 2.0 — 1M
-    if model.contains("gemini-2.0") {
-        return Some(1_048_576);
-    }
     // xAI Grok — 131k
     if model.contains("grok") {
         return Some(131_072);
@@ -885,6 +873,13 @@ pub fn handle_model_info(model_name: &str, current_model: &str) {
     match model_context_window(model_name) {
         Some(ctx) => println!("  {DIM}Context:{RESET}   {}", format_context_size(ctx)),
         None => println!("  {DIM}Context:{RESET}   {YELLOW}unknown{RESET}"),
+    }
+    // Gemini's published output cap: the same authority the run path reads.
+    if let Some(out) = crate::agent_builder::declared_output_ceiling("google", model_name, 0) {
+        println!(
+            "  {DIM}Output:{RESET}    {}",
+            format_context_size(u64::from(out))
+        );
     }
 
     // Pricing — use estimate_cost with synthetic Usage to extract per-MTok rates
@@ -2683,8 +2678,14 @@ More text.
         assert_eq!(model_context_window("o3"), Some(200_000));
         assert_eq!(model_context_window("o4-mini"), Some(200_000));
         // Google
-        assert_eq!(model_context_window("gemini-2.5-pro"), Some(1_048_576));
-        assert_eq!(model_context_window("gemini-2.0-flash"), Some(1_048_576));
+        assert_eq!(
+            model_context_window("gemini-2.5-flash-lite"),
+            Some(1_048_576)
+        );
+        // #1162: no longer offered and no row, so no pinned window.
+        assert_eq!(model_context_window("gemini-2.5-pro"), None);
+        // #1118: shut down per Google's models page, so no pinned window.
+        assert_eq!(model_context_window("gemini-2.0-flash"), None);
         // xAI
         assert_eq!(model_context_window("grok-4"), Some(131_072));
         // DeepSeek
@@ -2800,7 +2801,7 @@ More text.
             ("gpt-4.1", Some(1_048_576)),
             ("gpt-4o", Some(128_000)),
             ("o3", Some(200_000)),
-            ("gemini-2.5-pro", Some(1_048_576)),
+            ("gemini-2.5-flash-lite", Some(1_048_576)),
             ("grok-4", Some(131_072)),
             ("deepseek-v4-pro", Some(128_000)),
             ("codestral", Some(128_000)),

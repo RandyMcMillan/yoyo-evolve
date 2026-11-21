@@ -33,15 +33,22 @@ Use safe mode to:
 
 Once you've identified the problem, fix the offending config/skill/server and restart normally.
 
-## "error: config file is malformed"
+## "error: config file is not valid TOML"
 
-yoyo found a syntax problem its lenient config reader can't fix for you: a quoted value with no closing quote (`model = "claude-haiku-5-5`) or a `[section` header with no `]`. The message names each `file:line`.
+Every config file yoyo loads (`.yoyo.toml`, `~/.yoyo.toml`, the user config) is first read by a real TOML parser. If it is not valid TOML, yoyo stops with this error and **exit code 2**, before any API call. The message names `file:line:column`, gives the parser's reason, and shows the line with a caret under the problem:
 
-Starting a session (the REPL, `yoyo -p`, piped input, `yoyo review`) **refuses** with this error and **exit code 2**, before any API call. Read as written, the value would keep its stray quote and be sent anyway (a model id with a stray `"` 404s), and nobody writes an unterminated quote on purpose. git, cargo and Python's `tomllib` refuse the same file.
+```
+error: .yoyo.toml:1:9: config file is not valid TOML: string values must be quoted, expected literal string
+  |
+1 | model = m1
+  |         ^^
+```
 
-To get going: fix the named lines, or move the file aside (`mv .yoyo.toml .yoyo.toml.bak`); yoyo then uses the next config file it finds, or its defaults.
+Common causes: a string value without quotes (`model = m1` must be `model = "m1"`), a quote that never closes, a `[section` header with no `]`, or the same key written twice (`model = "a"` then `model = "b"`; earlier versions silently used the last one). git, cargo and Python's `tomllib` refuse the same files.
 
-The inspection commands (`yoyo config get`, `yoyo config show`, `yoyo doctor`, `yoyo model`, `yoyo permissions`) and `yoyo setup` still run, with a `warning: config file is malformed` line instead, so you can look at what yoyo read while you fix it. The detector skips the inside of multi-line strings (`"""` / `'''`), so their contents never trigger it.
+Every command that reads the config refuses the same way: starting a session (the REPL, `yoyo -p`, piped input, `yoyo review`) and the inspection commands (`yoyo config show`, `yoyo config get`, `yoyo doctor`, `yoyo model`, `yoyo permissions`, `yoyo version -v`); `yoyo config show` exits 1 rather than 2. Values read from a file that is not TOML would be guesses, so none of them shows or uses them.
+
+To get going: fix the named line in your editor, or move the file aside (`mv .yoyo.toml .yoyo.toml.bak`); yoyo then uses the next config file it finds, or its defaults.
 
 ## "error: no CA certificates could be loaded"
 
@@ -61,15 +68,17 @@ yoyo now refuses with this message and **exit code 1** before any agent is built
 
 ```
 error: No API key found.
-Set ANTHROPIC_API_KEY or API_KEY environment variable.
+Set OPENAI_API_KEY env var, use --api-key <key>, or add api_key to .yoyo.toml.
 ```
 
-**Fix:** Set your Anthropic API key:
+The variable it names is the provider's own (`ANTHROPIC_API_KEY` for the default `anthropic` provider, `OPENAI_API_KEY` above for `--provider openai`).
+
+**Fix:** set that variable, for example:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
-yoyo checks `ANTHROPIC_API_KEY` first, then `API_KEY`. At least one must be set and non-empty.
+yoyo checks the provider's own variable first, then the generic `API_KEY`, then `api_key` in a config file. One must be set and non-empty. `ANTHROPIC_API_KEY` counts only for `--provider anthropic`: having it set does not satisfy `--provider openai` (or any other provider), because yoyo no longer sends your Anthropic key to other vendors (#1170).
 
 ## "No input on stdin"
 
@@ -105,6 +114,10 @@ The same check covers two other readers. At startup, a project instruction file 
 This appears when the Anthropic API returns an error. Common causes:
 
 - **Invalid API key** — check your key is correct and active
+  (Google reports a bad key as `400` with `API_KEY_INVALID` / "API key not valid" rather
+  than 401; yoyo treats that as an auth failure too and names the variable to set, e.g.
+  `GEMINI_API_KEY` / `GOOGLE_API_KEY`; xAI's bad-key reply is also a `400`,
+  "Incorrect API key provided", and gets the same hint naming `XAI_API_KEY`)
 - **Rate limiting** — you're sending too many requests; wait and retry
 - **Model unavailable** — the model you specified doesn't exist or you don't have access
 - **A model id from another vendor's family** — `--provider` and `--model` resolve

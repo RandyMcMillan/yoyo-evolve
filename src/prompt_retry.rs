@@ -242,38 +242,31 @@ pub fn tool_recovery_hint(tool_name: &str, attempt: u32) -> &'static str {
     }
 }
 
-/// Known phrases that indicate context overflow across LLM providers.
-/// Mirrors the upstream yoagent patterns so we can detect overflow from
-/// error *strings* (e.g., in RetriableError messages or raw API output)
-/// even when the structured `ProviderError::ContextOverflow` isn't available.
-const OVERFLOW_PHRASES: &[&str] = &[
-    "prompt is too long",
-    "input is too long",
-    "exceeds the context window",
-    "exceeds the maximum",
-    "maximum prompt length",
-    "reduce the length of the messages",
-    "maximum context length",
-    "exceeds the limit of",
-    "exceeds the available context size",
-    "greater than the context length",
-    "context window exceeds limit",
-    "exceeded model token limit",
-    "context length exceeded",
-    "context_length_exceeded",
-    "too many tokens",
-    "token limit exceeded",
-];
-
 /// Check if an error message indicates a context overflow / prompt-too-long error.
-/// Uses phrase matching against `OVERFLOW_PHRASES` since we often only have the raw
-/// structured `ProviderError`. Case-insensitive.
+///
+/// Delegates to yoagent's own reader of an assistant error message
+/// (`Message::is_context_overflow`): its overflow phrase list plus the
+/// `ProviderError::ContextOverflow` display prefix (which is how an empty-body
+/// 400/413 overflow arrives, with no phrase in it). Until #1167 this was a hand
+/// copy of yoagent's private phrase list, and it drifted twice: it kept the
+/// broad "exceeds the maximum", which matches Azure's peak-load rate limit, and
+/// never gained "model_context_window_exceeded". `prompt_retry_overflow_tests.rs`
+/// pins the verdicts against yoagent. Empty or whitespace-only text is never an
+/// overflow here: yoagent's empty-body rule keys on an HTTP status this string
+/// does not carry.
 pub fn is_overflow_error(msg: &str) -> bool {
-    if msg.is_empty() {
+    if msg.trim().is_empty() {
         return false;
     }
-    let lower = msg.to_lowercase();
-    OVERFLOW_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    yoagent::Message::assistant(
+        Vec::new(),
+        StopReason::Error,
+        "",
+        "",
+        yoagent::Usage::default(),
+    )
+    .with_error_message(msg)
+    .is_context_overflow()
 }
 
 /// Build a retry prompt after auto-compacting due to context overflow.
@@ -451,11 +444,7 @@ pub fn is_retriable_error(error_msg: &str) -> bool {
     // errors carrying those words — every error-shaped hit is self-authored
     // prose about this detector. They stay because the corpus is absent, not
     // because they were shown load-bearing; see `broad_word_tests`.
-    if mentions_retry_directive(&lower) {
-        return true;
-    }
-
-    false
+    mentions_retry_directive(&lower)
 }
 
 /// True when a tool error is a *deterministic refusal* — a guard that will
@@ -513,7 +502,7 @@ pub enum KeySource {
     Argv,
     ConfigFile,
     /// The environment variable actually read (a provider alias such as
-    /// `GEMINI_API_KEY`, or the `ANTHROPIC_API_KEY`/`API_KEY` fallback).
+    /// `GEMINI_API_KEY`, or the generic `API_KEY` fallback; #1170).
     Env(String),
     Missing,
 }
@@ -544,9 +533,15 @@ pub fn auth_failure_message(provider: &str, env_var: &str, source: &KeySource) -
             let own = crate::providers::provider_api_key_vars(provider);
             if !own.is_empty() && !own.contains(&var.as_str()) {
                 // The provider's own variables were all unset, so the generic
-                // fallback sent another key (CLAUDE.md's wrong-token 401).
+                // fallback sent another key (CLAUDE.md's wrong-token 401). Name
+                // every own variable: google reads GEMINI_API_KEY first (#1163).
+                let unset = match own {
+                    [one] => format!("{one} is not set"),
+                    [init @ .., last] => format!("Neither {} nor {last} is set", init.join(", ")),
+                    [] => format!("{env_var} is not set"),
+                };
                 format!(
-                    "{head}\n  {env_var} is not set, so the key from {var} was sent instead, and the API rejected it.\n\
+                    "{head}\n  {unset}, so the key from {var} was sent instead, and the API rejected it.\n\
                      Set the right one with: export {env_var}=<your-key>\n{config_hint}"
                 )
             } else {
@@ -573,6 +568,9 @@ mod prompt_retry_auth_tests;
 #[cfg(test)]
 #[path = "prompt_retry_dns_tests.rs"]
 mod prompt_retry_dns_tests;
+#[cfg(test)]
+#[path = "prompt_retry_overflow_tests.rs"]
+mod prompt_retry_overflow_tests;
 
 /// Diagnose a non-retriable API error and return a user-friendly message
 /// with actionable suggestions. Returns `None` for errors that don't match
@@ -597,8 +595,13 @@ pub(crate) fn diagnose_api_error_for(error: &str, model: &str, oneshot: bool) ->
         || lower.contains("invalid api key")
         || lower.contains("invalid_api_key")
         || lower.contains("authentication")
+        // Google (#1163) and xAI (#1165) reject a bad key with a 400, not 401 (bodies
+        // seen on the wire). Never bare `400`/`invalid_argument`: those cover bad fields.
+        || lower.contains("api_key_invalid")
+        || lower.contains("api key not valid")
+        || lower.contains("incorrect api key")
     {
-        let env_var = crate::cli::provider_api_key_env(&provider).unwrap_or("ANTHROPIC_API_KEY");
+        let env_var = crate::cli::provider_api_key_env(&provider).unwrap_or("API_KEY");
         // The source cli.rs recorded when it resolved the key (#1062); with none
         // recorded, the old env-presence reading, so that path is unchanged.
         let source = KEY_SOURCE.get().cloned().unwrap_or_else(|| {

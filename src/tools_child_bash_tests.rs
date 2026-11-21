@@ -58,10 +58,9 @@ async fn child_refuses_hard_denied_command_in_both_approval_states() {
             let err = run(child_bash(parent_confirms, explore).as_ref(), &cmd)
                 .await
                 .expect_err("child must refuse a hard-denied command");
-            assert_eq!(
-                err,
-                "Command blocked by safety policy: contains 'rm -rf /'. This pattern is denied for safety.",
-                "parent_confirms={parent_confirms} explore={explore}"
+            assert!(
+                err.starts_with("Command blocked by safety policy: `rm -rf /` reads as "),
+                "parent_confirms={parent_confirms} explore={explore}: {err}"
             );
             assert_eq!(err, parent_err, "child text must be the parent's");
         }
@@ -95,8 +94,9 @@ async fn child_bash_refuses_flagged_command_when_parent_confirms() {
 
 #[tokio::test]
 async fn child_bash_allows_flagged_command_when_parent_would_not_ask() {
-    // A harmless flagged command, so the allow path can actually run.
-    let cmd = "echo 'TRUNCATE TABLE logs_ZZ'";
+    // A harmless flagged command, so the allow path can actually run. Piped:
+    // a bare echo's quoted text is a mention since #1196, and is not flagged.
+    let cmd = "echo 'TRUNCATE TABLE logs_ZZ' | cat";
     assert!(
         analyze_bash_command(cmd).is_some(),
         "fixture must be flagged"
